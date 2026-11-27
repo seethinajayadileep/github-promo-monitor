@@ -9,6 +9,28 @@ const sourceTypes = ['code', 'commit', 'issue', 'watchlist'];
 const confidenceLevels = ['high', 'medium', 'low'];
 const statuses = ['active', 'unverified', 'likely_expired', 'expired', 'flagged'];
 
+function formatIstDateTime(value: string | Date): string {
+  return `${new Date(value).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  })} IST`;
+}
+
+function formatIstDate(value: string | Date): string {
+  return new Date(value).toLocaleDateString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  });
+}
+
 function firstParam(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
@@ -58,7 +80,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Re
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-900/80 px-4 py-3 text-sm">
           <div className="font-medium text-slate-200">Worker status</div>
-          <div className="mt-1 text-slate-400">Last scan: {worker.ranAt ? new Date(worker.ranAt).toLocaleString() : 'no scan recorded'}</div>
+          <div className="mt-1 text-slate-400">Last scan: {worker.ranAt ? formatIstDateTime(worker.ranAt) : 'no scan recorded'}</div>
           <div className="text-slate-400">GitHub headroom: {worker.rateLimitRemaining ?? 'unknown'} remaining · {worker.recentRuns} scans/hour</div>
         </div>
       </header>
@@ -103,10 +125,10 @@ export default async function DashboardPage({ searchParams }: { searchParams: Re
                 <p className="mt-3 text-sm leading-6 text-slate-300">{row.offer_summary || 'No offer summary extracted.'}</p>
                 <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500">
                   <span>Repo: {row.repo_full_name}</span>
-                  <span>First seen: {new Date(row.first_seen_at).toLocaleDateString()}</span>
-                  <span>Last seen: {new Date(row.last_seen_at).toLocaleDateString()}</span>
+                  <span>First seen: {formatIstDate(row.first_seen_at)}</span>
+                  <span>Last seen: {formatIstDate(row.last_seen_at)}</span>
                   <span>Sightings: {row.sighting_count}</span>
-                  {row.expires_at ? <span>Expires: {new Date(row.expires_at).toLocaleDateString()}</span> : null}
+                  {row.expires_at ? <span>Expires: {formatIstDate(row.expires_at)}</span> : null}
                 </div>
                 <div className="mt-3 flex flex-wrap gap-3 text-sm">
                   <a className="text-sky-300 hover:text-sky-200" href={row.source_url} target="_blank" rel="noreferrer">GitHub source</a>
