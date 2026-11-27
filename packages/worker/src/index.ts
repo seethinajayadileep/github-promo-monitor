@@ -1,4 +1,4 @@
-import { GitHubClient, applyDailyExpiry, createPool } from '@promo/shared';
+import { GitHubClient, applyDailyExpiry, configuredLlmProvider, createPool } from '@promo/shared';
 import { config, loadVendors, loadWatchlist } from './config.js';
 import { scanFastLane, scanHistoricalBackfill, scanSlowLane, scanWatchlist, type PollerOptions } from './poller.js';
 
@@ -45,7 +45,8 @@ async function main(): Promise<void> {
     watchlistRepos: watchlist.length,
     fastLaneIntervalMs: config.fastLaneIntervalMs,
     slowLaneIntervalMs: config.slowLaneIntervalMs,
-    tokenCount: github.tokenPool.size
+    tokenCount: github.tokenPool.size,
+    llmProvider: configuredLlmProvider()
   });
 
   const dailyExpiry = async () => {

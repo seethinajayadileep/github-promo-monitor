@@ -1,4 +1,5 @@
 import {
+  BACKFILL_WINDOW_COMPLETE_KEY,
   GitHubClient,
   addCommitDateWindow,
   addIssueQualifier,
@@ -15,6 +16,7 @@ import {
   notifyAll,
   upsertPromoCandidate,
   type PromoCandidate,
+  type RateLimitState,
   type ScanMode,
   type SourceType,
   type VendorConfig,
@@ -70,12 +72,21 @@ async function enrichCandidates(candidates: PromoCandidate[], vendors: VendorCon
   for (const candidate of candidates.slice(0, 10)) {
     try {
       const llm = await extractWithLlm(candidate.snippet, vendors);
-      enriched.push(applyLlmExtraction(candidate, llm, vendors));
+      const applied = applyLlmExtraction(candidate, llm, vendors);
+      if (applied) enriched.push(applied);
     } catch {
       enriched.push(candidate);
     }
   }
   return enriched;
+}
+
+function rateLimitFields(rateLimit: RateLimitState): { rateLimitRemaining?: number; rateLimitLimit?: number; rateLimitResource?: string } {
+  return {
+    rateLimitRemaining: rateLimit.remaining,
+    rateLimitLimit: rateLimit.limit,
+    rateLimitResource: rateLimit.resource
+  };
 }
 
 async function ingestText(
@@ -189,7 +200,7 @@ async function scanCommitSearch(
     etag: response.etag,
     hitsFound: response.data?.total_count ?? items.length,
     newCodes,
-    rateLimitRemaining: response.rateLimit.remaining
+    ...rateLimitFields(response.rateLimit)
   });
   await options.github.paceIfNeeded(response.rateLimit, mode === 'backfill' ? config.minimumRateLimitPercent : config.liveMinimumRateLimitPercent);
   return { hitsFound: items.length, newCodes, rateLimitRemaining: response.rateLimit.remaining, etag: response.etag };
@@ -222,7 +233,7 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
     etag: response.etag,
     hitsFound: response.data?.total_count ?? items.length,
     newCodes,
-    rateLimitRemaining: response.rateLimit.remaining
+    ...rateLimitFields(response.rateLimit)
   });
   await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
   return { hitsFound: items.length, newCodes, rateLimitRemaining: response.rateLimit.remaining, etag: response.etag };
@@ -278,7 +289,7 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
     etag: response.etag,
     hitsFound: response.data?.total_count ?? items.length,
     newCodes,
-    rateLimitRemaining: response.rateLimit.remaining
+    ...rateLimitFields(response.rateLimit)
   });
   await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
   return { hitsFound: items.length, newCodes, rateLimitRemaining: response.rateLimit.remaining, etag: response.etag };
@@ -324,7 +335,7 @@ export async function scanWatchlist(options: PollerOptions): Promise<void> {
         etag: response.etag,
         hitsFound: items.length,
         newCodes,
-        rateLimitRemaining: response.rateLimit.remaining
+        ...rateLimitFields(response.rateLimit)
       });
       await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
     } catch (error) {
@@ -358,13 +369,27 @@ export async function scanHistoricalBackfill(options: PollerOptions): Promise<vo
   if (new Date(window.end).getTime() < new Date(config.backfillStopDate).getTime()) return;
   const cursorWindow = `${window.start}..${window.end}`;
   const queries = buildSearchQueries(options.vendors);
+  let failedQueries = 0;
   for (let index = 0; index < queries.length; index += 1) {
     const query = addCommitDateWindow(queries[index], window.start, window.end);
     try {
       await scanCommitSearch(options, query, `backfill:${index}`, 'backfill', cursorWindow);
     } catch (error) {
+      failedQueries += 1;
       log('backfill_query_failed', { cursorWindow, bundle: index, error: error instanceof Error ? error.message : 'unknown' });
     }
   }
+  if (failedQueries > 0) {
+    log('backfill_window_incomplete', { cursorWindow, failedQueries });
+    return;
+  }
+  await insertScanRun(options.pool, {
+    queryKey: BACKFILL_WINDOW_COMPLETE_KEY,
+    surface: 'window-complete',
+    mode: 'backfill',
+    cursorWindow,
+    hitsFound: 0,
+    newCodes: 0
+  });
   log('backfill_window_complete', { cursorWindow });
 }

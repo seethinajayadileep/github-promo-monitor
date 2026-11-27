@@ -41,6 +41,13 @@ export interface ExtractedPromo {
   confidence?: Confidence;
 }
 
+export interface RateLimitBucket {
+  remaining: number | null;
+  limit: number | null;
+  resource: string;
+  at: string | null;
+}
+
 export interface ScanRunInsert {
   queryKey: string;
   surface: string;
@@ -50,6 +57,8 @@ export interface ScanRunInsert {
   hitsFound: number;
   newCodes: number;
   rateLimitRemaining?: number;
+  rateLimitLimit?: number;
+  rateLimitResource?: string;
 }
 
 export interface PromoCodeRow {

@@ -22,6 +22,12 @@ services:
         sync: false
       - key: GITHUB_TOKENS
         sync: false
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: SARVAM_API_URL
+        sync: false
+      - key: SARVAM_MODEL
+        value: sarvam-105b
       - key: OPENAI_API_KEY
         sync: false
       - key: GEMINI_API_KEY

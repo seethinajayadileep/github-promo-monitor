@@ -1,6 +1,9 @@
 import pg from 'pg';
 import { canonicalCode } from './dedupe.js';
-import type { PromoCandidate, PromoCodeRow, PromoStatus, ScanRunInsert } from './types.js';
+import { inferRateLimitResource } from './github.js';
+import type { PromoCandidate, PromoCodeRow, PromoStatus, RateLimitBucket, ScanRunInsert } from './types.js';
+
+export const BACKFILL_WINDOW_COMPLETE_KEY = 'backfill-window-complete';
 
 const { Pool } = pg;
 export type DbPool = pg.Pool;
@@ -85,9 +88,23 @@ export async function upsertPromoCandidate(pool: pg.Pool, candidate: PromoCandid
 
 export async function insertScanRun(pool: pg.Pool, run: ScanRunInsert): Promise<void> {
   await pool.query(
-    `INSERT INTO scan_runs (query_key, surface, mode, cursor_window, etag, hits_found, new_codes, rate_limit_remaining)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-    [run.queryKey, run.surface, run.mode, run.cursorWindow ?? null, run.etag ?? null, run.hitsFound, run.newCodes, run.rateLimitRemaining ?? null]
+    `INSERT INTO scan_runs (
+       query_key, surface, mode, cursor_window, etag, hits_found, new_codes,
+       rate_limit_remaining, rate_limit_limit, rate_limit_resource
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [
+      run.queryKey,
+      run.surface,
+      run.mode,
+      run.cursorWindow ?? null,
+      run.etag ?? null,
+      run.hitsFound,
+      run.newCodes,
+      run.rateLimitRemaining ?? null,
+      run.rateLimitLimit ?? null,
+      run.rateLimitResource ?? inferRateLimitResource(run.surface)
+    ]
   );
 }
 
@@ -127,7 +144,7 @@ export interface DashboardFilters {
   offset?: number;
 }
 
-export async function queryPromoCodes(pool: pg.Pool, filters: DashboardFilters): Promise<PromoCodeRow[]> {
+function buildPromoFilters(filters: DashboardFilters): { whereSql: string; params: unknown[] } {
   const where: string[] = [];
   const params: unknown[] = [];
   const add = (clause: string, value: unknown) => {
@@ -143,14 +160,25 @@ export async function queryPromoCodes(pool: pg.Pool, filters: DashboardFilters):
   if (filters.sourceType) add('source_type = ?', filters.sourceType);
   if (filters.confidence) add('confidence = ?', filters.confidence);
   if (filters.status) add('status = ?', filters.status);
+  return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+}
+
+export async function queryPromoCodes(pool: pg.Pool, filters: DashboardFilters): Promise<PromoCodeRow[]> {
+  const { whereSql, params } = buildPromoFilters(filters);
   const sort = filters.sort === 'sightings' ? 'sighting_count DESC, last_seen_at DESC' : 'last_seen_at DESC, id DESC';
   params.push(Math.min(filters.limit ?? 100, 200));
   const limitParam = params.length;
   params.push(filters.offset ?? 0);
   const offsetParam = params.length;
-  const sql = `SELECT * FROM promo_codes ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${sort} LIMIT $${limitParam} OFFSET $${offsetParam}`;
+  const sql = `SELECT * FROM promo_codes ${whereSql} ORDER BY ${sort} LIMIT $${limitParam} OFFSET $${offsetParam}`;
   const result = await pool.query<PromoCodeRow>(sql, params);
   return result.rows;
+}
+
+export async function countPromoCodes(pool: pg.Pool, filters: DashboardFilters): Promise<number> {
+  const { whereSql, params } = buildPromoFilters(filters);
+  const result = await pool.query<{ count: string }>(`SELECT count(*)::text AS count FROM promo_codes ${whereSql}`, params);
+  return Number(result.rows[0]?.count ?? 0);
 }
 
 export async function listFilterValues(pool: pg.Pool): Promise<{ vendors: string[]; categories: string[] }> {
@@ -164,23 +192,92 @@ export async function updatePromoStatus(pool: pg.Pool, id: number, status: Promo
   return (result.rowCount ?? 0) > 0;
 }
 
-export async function latestScanStatus(pool: pg.Pool): Promise<{ ranAt: string | null; rateLimitRemaining: number | null; recentRuns: number }> {
-  const latest = await pool.query<{ ran_at: string; rate_limit_remaining: number | null }>(
-    'SELECT ran_at, rate_limit_remaining FROM scan_runs ORDER BY ran_at DESC LIMIT 1'
-  );
+export interface ScanStatus {
+  ranAt: string | null;
+  rateLimitRemaining: number | null;
+  recentRuns: number;
+  rateLimits: {
+    core?: RateLimitBucket;
+    search?: RateLimitBucket;
+    code_search?: RateLimitBucket;
+  };
+}
+
+function toBucket(row: { ran_at: string; rate_limit_remaining: number | null; rate_limit_limit?: number | null; resource: string }): RateLimitBucket {
+  return {
+    remaining: row.rate_limit_remaining,
+    limit: row.rate_limit_limit ?? null,
+    resource: row.resource,
+    at: row.ran_at
+  };
+}
+
+export async function latestScanStatus(pool: pg.Pool): Promise<ScanStatus> {
   const count = await pool.query<{ count: string }>(`SELECT count(*)::text AS count FROM scan_runs WHERE ran_at > now() - interval '1 hour'`);
+  const recentRuns = Number(count.rows[0]?.count ?? 0);
+
+  type StatusRow = {
+    ran_at: string;
+    rate_limit_remaining: number | null;
+    rate_limit_limit?: number | null;
+    rate_limit_resource?: string | null;
+    surface: string;
+  };
+
+  let rows: StatusRow[] = [];
+  try {
+    const result = await pool.query<StatusRow>(
+      `SELECT ran_at, rate_limit_remaining, rate_limit_limit, rate_limit_resource, surface
+       FROM scan_runs
+       WHERE rate_limit_remaining IS NOT NULL
+       ORDER BY ran_at DESC
+       LIMIT 80`
+    );
+    rows = result.rows;
+  } catch {
+    const result = await pool.query<StatusRow>(
+      `SELECT ran_at, rate_limit_remaining, surface
+       FROM scan_runs
+       WHERE rate_limit_remaining IS NOT NULL
+       ORDER BY ran_at DESC
+       LIMIT 80`
+    );
+    rows = result.rows;
+  }
+
+  const rateLimits: ScanStatus['rateLimits'] = {};
+  for (const row of rows) {
+    const resource = inferRateLimitResource(row.surface, row.rate_limit_resource);
+    if (resource === 'core' && !rateLimits.core) rateLimits.core = toBucket({ ...row, resource });
+    if (resource === 'search' && !rateLimits.search) rateLimits.search = toBucket({ ...row, resource });
+    if (resource === 'code_search' && !rateLimits.code_search) rateLimits.code_search = toBucket({ ...row, resource });
+    if (rateLimits.core && rateLimits.search && rateLimits.code_search) break;
+  }
+
+  const latest = await pool.query<{ ran_at: string }>('SELECT ran_at FROM scan_runs ORDER BY ran_at DESC LIMIT 1');
   return {
     ranAt: latest.rows[0]?.ran_at ?? null,
-    rateLimitRemaining: latest.rows[0]?.rate_limit_remaining ?? null,
-    recentRuns: Number(count.rows[0]?.count ?? 0)
+    rateLimitRemaining: rateLimits.core?.remaining ?? null,
+    recentRuns,
+    rateLimits
   };
 }
 
 export async function latestBackfillWindow(pool: pg.Pool): Promise<string | undefined> {
+  const complete = await pool.query<{ cursor_window: string | null }>(
+    `SELECT cursor_window FROM scan_runs
+     WHERE mode = 'backfill' AND query_key = $1 AND cursor_window IS NOT NULL
+     ORDER BY ran_at DESC LIMIT 1`,
+    [BACKFILL_WINDOW_COMPLETE_KEY]
+  );
+  if (complete.rows[0]?.cursor_window) return complete.rows[0].cursor_window;
+
+  // Legacy fallback: no completion markers exist yet. Prefer not to restart history.
   const result = await pool.query<{ cursor_window: string | null }>(
     `SELECT cursor_window FROM scan_runs
-     WHERE mode = 'backfill' AND cursor_window IS NOT NULL
-     ORDER BY ran_at DESC LIMIT 1`
+     WHERE mode = 'backfill' AND cursor_window IS NOT NULL AND query_key <> $1
+     ORDER BY ran_at DESC LIMIT 1`,
+    [BACKFILL_WINDOW_COMPLETE_KEY]
   );
   return result.rows[0]?.cursor_window ?? undefined;
 }

@@ -39,9 +39,9 @@ Pass 1 requires both:
 1. a public-sharing cue such as `promo code`, `coupon`, `hackathon credits`, `free credits`, `use code`, `redeem`, or `partner perk`; and
 2. a configured SaaS/AI/developer-tool vendor or matching redemption URL.
 
-Pass 1 also blocks generic uppercase stopwords (`README`, `LICENSE`, `OPENAI`, `HTTPS`, etc.) and vendor-name tokens so vendor names are not extracted as codes.
+Pass 1 also blocks generic uppercase stopwords (`README`, `LICENSE`, `OPENAI`, `HTTPS`, etc.), vendor-name tokens, license/CVE identifiers, and common non-promo compounds (`BSD-3-CLAUSE`, `TIME-LIMITED`, `CVE-2026-…`). Codes must appear near the vendor name or domain, and low-confidence hits that only matched a docs URL elsewhere in a large file are dropped.
 
-Pass 2 optionally calls a low-cost LLM structured JSON extractor using `OPENAI_API_KEY` or `GEMINI_API_KEY`. If neither is configured, extraction continues with pass 1 only. The expected JSON shape is:
+Pass 2 optionally calls a low-cost LLM structured JSON extractor. `SARVAM_API_KEY` (Sarvam 105B) takes priority, then `OPENAI_API_KEY`, then `GEMINI_API_KEY`. If none is configured, extraction continues with pass 1 only. When the LLM is configured and returns `is_public_promo=false` or no valid code, the candidate is dropped. The expected JSON shape is:
 
 ```json
 {
@@ -61,8 +61,8 @@ Pass 2 optionally calls a low-cost LLM structured JSON extractor using `OPENAI_A
 - **Fast lane (default every 90 seconds):** Commits Search sorted by `committer-date` plus Issues Search sorted by `created`.
 - **Slow lane (default every 20 minutes):** Code Search over `README.md`, `PERKS.md`, and `docs/`.
 - **Watchlist:** Repositories in `watchlist.json` are polled directly with Core REST `GET /repos/{owner}/{repo}/commits`; matching commits are expanded through commit-detail API calls.
-- **Historical backfill:** The worker walks backwards through `committer-date:YYYY-MM-DD..YYYY-MM-DD` windows, fetch commit diffs, persists every window in `scan_runs`, and never alerts for historical finds.
-- **Adaptive pacing:** Reads `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and uses conditional `If-None-Match` requests with ETags. Backfill backs off when less than roughly 30% rate-limit budget remains.
+- **Historical backfill:** The worker walks backwards through `committer-date:YYYY-MM-DD..YYYY-MM-DD` windows, fetch commit diffs, persists every window in `scan_runs`, and never alerts for historical finds. A window is marked complete only after every query in that window succeeds.
+- **Adaptive pacing:** Serializes GitHub requests across lanes, reads `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After`, and uses conditional `If-None-Match` requests with ETags. Secondary rate limits / 403 abuse detection wait at least 60 seconds with jitter. Backfill backs off when less than roughly 30% rate-limit budget remains. `/health` reports core, search, and code-search headroom separately.
 - **Token pool:** Supports one `GITHUB_TOKEN` or comma-separated `GITHUB_TOKENS`.
 
 ## Database schema
@@ -94,7 +94,8 @@ The dashboard supports:
 - One-click copy
 - Direct GitHub source and redemption links
 - Admin-protected status changes through `ADMIN_SECRET`
-- `/health` plus a worker status bar with last scan time and GitHub rate-limit headroom
+- Pagination (50 codes per page) that preserves search and filter state
+- `/health` plus a worker status bar with last scan time and separate core, search, and code-search rate-limit headroom
 
 ## Render deployment
 
@@ -127,7 +128,7 @@ Optionally configure LLM extraction and alert channels listed in `.env.example`.
 ### 4. Verify deployment
 
 - Open the dashboard URL Render assigns to `promo-dashboard`.
-- Check `/health`; it returns database status, latest scan time, scan count, and rate-limit headroom.
+- Check `/health`; it returns database status, latest scan time, scan count, and separate core / search / code-search rate-limit headroom.
 - Watch `promo-worker` logs for `scan_complete` events.
 - Confirm rows appear in `promo_codes` after matching public GitHub content is found.
 

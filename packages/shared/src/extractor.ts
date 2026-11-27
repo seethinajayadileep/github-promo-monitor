@@ -21,6 +21,7 @@ const PUBLIC_CUES = [
 const STRONG_CUES = ['promo code', 'coupon', 'discount code', 'use code', 'redeem'];
 const CODE_PATTERN = /\b[A-Za-z][A-Za-z0-9_-]{4,31}\b/g;
 const URL_PATTERN = /https?:\/\/[^\s)\]>\"']+/gi;
+const VENDOR_PROXIMITY_CHARS = 280;
 
 const STOPWORDS = new Set([
   'README', 'LICENSE', 'OPENAI', 'HTTPS', 'HTTP', 'API', 'JSON', 'HTML', 'CSS', 'SQL', 'TODO', 'MIT', 'Apache',
@@ -29,6 +30,24 @@ const STOPWORDS = new Set([
   'TOKEN', 'SECRET', 'PASSWORD', 'BEARER', 'PRIVATE', 'PUBLIC', 'NODE', 'NPM', 'YARN', 'PNPM', 'ENV', 'TRUE', 'FALSE',
   'NULL', 'UNDEFINED', 'ERROR', 'WARNING', 'DEBUG', 'INFO', 'POST', 'GET', 'PUT', 'PATCH', 'DELETE'
 ]);
+
+const GENERIC_COMPOUND_CODES = new Set([
+  'TIME-LIMITED', 'SELF-HOSTED', 'OPEN-SOURCE', 'REAL-TIME', 'END-TO-END', 'RATE-LIMITED', 'RATE-LIMIT',
+  'PRODUCTION-READY', 'CROSS-PLATFORM', 'TYPE-SAFE', 'FULL-STACK', 'FRONT-END', 'BACK-END', 'CLIENT-SIDE',
+  'SERVER-SIDE', 'PRE-COMMIT', 'POST-COMMIT', 'CI-CD', 'NODE-JS', 'NEXT-JS', 'WELL-KNOWN', 'COPY-PASTE',
+  'DROP-IN', 'OPT-IN', 'OPT-OUT', 'NON-COMMERCIAL', 'TRADE-OFF', 'BEST-PRACTICE', 'GET-STARTED', 'QUICK-START',
+  'README-MD', 'LICENSE-MD', 'LEFT-HAND', 'RIGHT-HAND'
+]);
+
+const LICENSE_CODE_PATTERN = /^(?:BSD-\d+-CLAUSE|MIT-LICENSE|APACHE-?\d+(?:\.\d+)?|GPL-?(?:V)?\d+(?:\.\d+)?|LGPL-?(?:V)?\d+|AGPL-?(?:V)?\d+|MPL-?\d+(?:\.\d+)?|CC-BY(?:-[A-Z0-9]+)*|UNLICENSE)$/i;
+const CVE_CODE_PATTERN = /^CVE-\d{4}-\d{4,}$/i;
+const TECH_PREFIX_PATTERN = /^(?:UTF|UTF8|SHA|SHA1|SHA2|SHA3|MD5|AES|RSA|HTTP|HTTPS|TLS|SSL|ISO|RFC|IANA|IPV4|IPV6|UUID)[-_].+/i;
+
+export const SARVAM_DEFAULT_URL = 'https://api.sarvam.ai/v2/chat/completions';
+export const SARVAM_DEFAULT_MODEL = 'sarvam-105b';
+export const SARVAM_MAX_TOKENS = 1536;
+
+const LLM_SYSTEM_PROMPT = 'Extract only intentionally public SaaS/AI/developer-tool promotional codes. Never output credentials. Return strict JSON.';
 
 export interface PassOneInput {
   text: string;
@@ -44,6 +63,8 @@ export interface FilteredExtraction {
   candidates: PromoCandidate[];
   droppedReason?: string;
 }
+
+export type LlmProvider = 'sarvam' | 'openai' | 'gemini' | 'none';
 
 function vendorStopwords(vendors: VendorConfig[]): Set<string> {
   const words = new Set<string>();
@@ -65,17 +86,29 @@ function hasPublicSharingCue(lowerText: string): boolean {
   return PUBLIC_CUES.some((cue) => lowerText.includes(cue));
 }
 
+function vendorTerms(vendor: VendorConfig): string[] {
+  return [vendor.name, vendor.id, ...vendor.keywords].map((term) => term.toLowerCase()).filter(Boolean);
+}
+
 function matchingVendor(text: string, vendors: VendorConfig[]): VendorConfig | undefined {
   const lower = text.toLowerCase();
-  return vendors.find((vendor) => {
-    const terms = [vendor.name, ...vendor.keywords].map((term) => term.toLowerCase());
-    return terms.some((term) => term && lower.includes(term));
-  });
+  return vendors.find((vendor) => vendorTerms(vendor).some((term) => term && lower.includes(term)));
 }
 
 function matchingVendorByUrl(text: string, vendors: VendorConfig[]): VendorConfig | undefined {
   const lower = text.toLowerCase();
   return vendors.find((vendor) => vendor.domains.some((domain) => lower.includes(domain.toLowerCase())));
+}
+
+function windowAround(text: string, index: number, length: number, radius = VENDOR_PROXIMITY_CHARS): string {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(text.length, index + length + radius);
+  return text.slice(start, end);
+}
+
+function matchingVendorNear(text: string, index: number, length: number, vendors: VendorConfig[]): VendorConfig | undefined {
+  const nearby = windowAround(text, index, length);
+  return matchingVendor(nearby, vendors) ?? matchingVendorByUrl(nearby, vendors);
 }
 
 function redemptionUrlFor(text: string, vendor?: VendorConfig): string | undefined {
@@ -96,9 +129,18 @@ function cleanCode(raw: string): string {
   return canonicalCode(raw).replace(/^[-_]+|[-_]+$/g, '');
 }
 
+export function isRejectedCodeToken(raw: string): boolean {
+  const token = raw.toUpperCase();
+  if (GENERIC_COMPOUND_CODES.has(token)) return true;
+  if (LICENSE_CODE_PATTERN.test(token) || CVE_CODE_PATTERN.test(token) || TECH_PREFIX_PATTERN.test(token)) return true;
+  if (/^HTTPS?-/i.test(token)) return true;
+  return false;
+}
+
 function isPlausibleCode(raw: string, original: string, stopwords: Set<string>): boolean {
   if (raw.length < 5 || raw.length > 32) return false;
   if (stopwords.has(raw) || STOPWORDS.has(raw)) return false;
+  if (isRejectedCodeToken(raw)) return false;
   if (!/[A-Z]/.test(raw)) return false;
   if (/^\d+$/.test(raw)) return false;
   if (/^(?:19|20)\d{2}$/.test(raw)) return false;
@@ -119,7 +161,7 @@ function sentenceAround(text: string, index: number, length: number): string {
 function scoreConfidence(context: string, vendor: VendorConfig, redeemUrl?: string): Confidence {
   const lower = context.toLowerCase();
   const strongCue = STRONG_CUES.some((cue) => lower.includes(cue));
-  const vendorMentioned = [vendor.name, ...vendor.keywords].some((term) => lower.includes(term.toLowerCase()));
+  const vendorMentioned = vendorTerms(vendor).some((term) => lower.includes(term));
   const hasExpiry = /(?:expires?|valid until|valid through|ends?)\b/i.test(context);
   if (strongCue && vendorMentioned && (redeemUrl || hasExpiry)) return 'high';
   if (strongCue && vendorMentioned) return 'medium';
@@ -144,8 +186,8 @@ export function extractPassOne(input: PassOneInput): FilteredExtraction {
   const lower = input.text.toLowerCase();
   if (!hasPublicSharingCue(lower)) return { candidates: [], droppedReason: 'stage3-no-public-sharing-cue' };
 
-  const vendor = matchingVendor(input.text, input.vendors) ?? matchingVendorByUrl(input.text, input.vendors);
-  if (!vendor) return { candidates: [], droppedReason: 'stage3-no-target-vendor-or-redemption-url' };
+  const fileVendor = matchingVendor(input.text, input.vendors) ?? matchingVendorByUrl(input.text, input.vendors);
+  if (!fileVendor) return { candidates: [], droppedReason: 'stage3-no-target-vendor-or-redemption-url' };
 
   const vendorWords = vendorStopwords(input.vendors);
   const candidates: PromoCandidate[] = [];
@@ -153,19 +195,23 @@ export function extractPassOne(input: PassOneInput): FilteredExtraction {
   for (const match of input.text.matchAll(CODE_PATTERN)) {
     const raw = cleanCode(match[0]);
     if (!isPlausibleCode(raw, match[0], vendorWords) || seenCodes.has(raw)) continue;
-    const context = sentenceAround(input.text, match.index ?? 0, match[0].length);
+    const index = match.index ?? 0;
+    const vendor = matchingVendorNear(input.text, index, match[0].length, input.vendors);
+    if (!vendor) continue;
+    const context = sentenceAround(input.text, index, match[0].length);
     const contextLower = context.toLowerCase();
     if (!hasPublicSharingCue(contextLower)) continue;
-    const redeemUrl = redemptionUrlFor(context, vendor) ?? redemptionUrlFor(input.text, vendor);
-    const confidence = scoreConfidence(context, vendor, redeemUrl);
-    if (confidence === 'low' && !redeemUrl) continue;
+    const contextRedeemUrl = redemptionUrlFor(context, vendor);
+    const confidence = scoreConfidence(context, vendor, contextRedeemUrl);
+    // Low-confidence hits kept only for a docs URL elsewhere in the file are dropped.
+    if (confidence === 'low' && !contextRedeemUrl) continue;
     seenCodes.add(raw);
     candidates.push({
       vendor: vendor.name,
       code: raw,
       category: vendor.category,
       offerSummary: offerSummary(context, vendor, raw),
-      redeemUrl,
+      redeemUrl: contextRedeemUrl ?? redemptionUrlFor(input.text, vendor),
       sourceUrl: input.sourceUrl,
       sourceType: input.sourceType,
       repoFullName: input.repoFullName,
@@ -183,9 +229,22 @@ function normalizeLlmConfidence(value: unknown): Confidence | undefined {
   return value === 'high' || value === 'medium' || value === 'low' ? value : undefined;
 }
 
-function parseLlmJson(value: string): ExtractedPromo | null {
+export function extractJsonObject(value: string): string | null {
+  const trimmed = value.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? trimmed).trim();
+  if (candidate.startsWith('{') && candidate.endsWith('}')) return candidate;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start >= 0 && end > start) return candidate.slice(start, end + 1);
+  return null;
+}
+
+export function parseLlmJson(value: string): ExtractedPromo | null {
+  const json = extractJsonObject(value);
+  if (!json) return null;
   try {
-    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const parsed = JSON.parse(json) as Record<string, unknown>;
     if (parsed.is_public_promo !== true) return { isPublicPromo: false };
     const expiresRaw = typeof parsed.expires_at === 'string' ? new Date(parsed.expires_at) : undefined;
     return {
@@ -202,6 +261,70 @@ function parseLlmJson(value: string): ExtractedPromo | null {
   }
 }
 
+export function configuredLlmProvider(env: NodeJS.ProcessEnv = process.env): LlmProvider {
+  if (env.SARVAM_API_KEY) return 'sarvam';
+  if (env.OPENAI_API_KEY) return 'openai';
+  if (env.GEMINI_API_KEY) return 'gemini';
+  return 'none';
+}
+
+export interface SarvamChatRequest {
+  url: string;
+  headers: Record<string, string>;
+  body: {
+    model: string;
+    messages: Array<{ role: string; content: string }>;
+    stream: false;
+    temperature: number;
+    reasoning_effort: 'low';
+    max_tokens: number;
+  };
+}
+
+export function buildSarvamChatRequest(prompt: string, env: NodeJS.ProcessEnv = process.env): SarvamChatRequest {
+  const apiKey = env.SARVAM_API_KEY ?? '';
+  return {
+    url: env.SARVAM_API_URL || SARVAM_DEFAULT_URL,
+    headers: {
+      'api-subscription-key': apiKey,
+      'Content-Type': 'application/json'
+    },
+    body: {
+      model: env.SARVAM_MODEL || SARVAM_DEFAULT_MODEL,
+      messages: [
+        { role: 'system', content: LLM_SYSTEM_PROMPT },
+        { role: 'user', content: prompt }
+      ],
+      stream: false,
+      temperature: 0.1,
+      reasoning_effort: 'low',
+      max_tokens: SARVAM_MAX_TOKENS
+    }
+  };
+}
+
+function llmPrompt(text: string, vendors: VendorConfig[]): string {
+  const vendorList = vendors.map((vendor) => `${vendor.name} (${vendor.domains.join(', ')})`).join('; ');
+  return `Classify and extract the public promo in this text. Vendors: ${vendorList}.\n` +
+    'Return exactly this JSON shape: {"is_public_promo":boolean,"vendor":string|null,"code":string|null,"offer_summary":string|null,"redeem_url":string|null,"expires_at":string|null,"confidence":"high"|"medium"|"low"}. ' +
+    'Set is_public_promo=false unless the text intentionally shares a public promo/coupon/credit code for a SaaS, AI, or developer tool.\n\nText:\n' + text.slice(0, 6000);
+}
+
+async function callSarvam(prompt: string): Promise<string | null> {
+  const apiKey = process.env.SARVAM_API_KEY;
+  if (!apiKey) return null;
+  const request = buildSarvamChatRequest(prompt);
+  const response = await fetch(request.url, {
+    method: 'POST',
+    headers: request.headers,
+    body: JSON.stringify(request.body),
+    signal: AbortSignal.timeout(30_000)
+  });
+  if (!response.ok) return null;
+  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  return body.choices?.[0]?.message?.content ?? null;
+}
+
 async function callOpenAi(prompt: string): Promise<string | null> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
@@ -213,7 +336,7 @@ async function callOpenAi(prompt: string): Promise<string | null> {
       temperature: 0,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: 'Extract only intentionally public SaaS/AI/developer-tool promotional codes. Never output credentials. Return strict JSON.' },
+        { role: 'system', content: LLM_SYSTEM_PROMPT },
         { role: 'user', content: prompt }
       ]
     }),
@@ -244,18 +367,25 @@ async function callGemini(prompt: string): Promise<string | null> {
 
 /** Stage 3 pass 2: optional low-cost LLM cleanup. Returns null when unconfigured or inconclusive. */
 export async function extractWithLlm(text: string, vendors: VendorConfig[]): Promise<ExtractedPromo | null> {
-  if (!process.env.OPENAI_API_KEY && !process.env.GEMINI_API_KEY) return null;
+  if (configuredLlmProvider() === 'none') return null;
   if (rejectSecrets(text).rejected || isCryptoOrSpam({ text, vendors })) return null;
-  const vendorList = vendors.map((vendor) => `${vendor.name} (${vendor.domains.join(', ')})`).join('; ');
-  const prompt = `Classify and extract the public promo in this text. Vendors: ${vendorList}.\n` +
-    'Return exactly this JSON shape: {"is_public_promo":boolean,"vendor":string|null,"code":string|null,"offer_summary":string|null,"redeem_url":string|null,"expires_at":string|null,"confidence":"high"|"medium"|"low"}. ' +
-    'Set is_public_promo=false unless the text intentionally shares a public promo/coupon/credit code for a SaaS, AI, or developer tool.\n\nText:\n' + text.slice(0, 6000);
-  const raw = process.env.OPENAI_API_KEY ? await callOpenAi(prompt) : await callGemini(prompt);
+  const prompt = llmPrompt(text, vendors);
+  const provider = configuredLlmProvider();
+  const raw = provider === 'sarvam'
+    ? await callSarvam(prompt)
+    : provider === 'openai'
+      ? await callOpenAi(prompt)
+      : await callGemini(prompt);
   return raw ? parseLlmJson(raw) : null;
 }
 
-export function applyLlmExtraction(candidate: PromoCandidate, llm: ExtractedPromo | null, vendors: VendorConfig[]): PromoCandidate {
-  if (!llm?.isPublicPromo || !llm.code) return candidate;
+/**
+ * Apply Pass-2 LLM results. Unconfigured/inconclusive results keep the Pass-1 candidate.
+ * An explicit rejection (`is_public_promo=false` or missing code) drops the candidate.
+ */
+export function applyLlmExtraction(candidate: PromoCandidate, llm: ExtractedPromo | null, vendors: VendorConfig[]): PromoCandidate | null {
+  if (!llm) return candidate;
+  if (!llm.isPublicPromo || !llm.code) return null;
   const llmVendor = vendors.find((vendor) => vendor.name.toLowerCase() === llm.vendor?.toLowerCase() || vendor.id === llm.vendor?.toLowerCase());
   return {
     ...candidate,
