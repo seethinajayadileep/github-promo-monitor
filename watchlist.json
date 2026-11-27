@@ -1,6 +1,4 @@
 [
-  { "repo": "githubstudent/student-developer-pack", "reason": "GitHub student developer perks and partner offers" },
   { "repo": "mlh/mlh-hackathon-organizer-guide", "reason": "MLH hackathon sponsor credits and perks references" },
-  { "repo": "Major-League-Hacking/mlh-hackathon-organizer-guide", "reason": "mirror/fork coverage when present" },
   { "repo": "hackclub/hackathons", "reason": "hackathon resources and sponsor perks" }
 ]

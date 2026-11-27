@@ -98,8 +98,7 @@ export class GitHubClient {
       return this.request<T>(path, { ...options, retryOnRateLimit: false });
     }
     if (!response.ok && response.status !== 304) {
-      const message = data && typeof data === 'object' && 'message' in data ? String((data as { message?: unknown }).message) : `HTTP ${response.status}`;
-      throw new Error(`GitHub request failed: ${message}`);
+      throw new Error(formatGitHubError(response.status, data));
     }
     return { status: response.status, data, etag, notModified: false, rateLimit };
   }
@@ -120,6 +119,18 @@ export class GitHubClient {
     }
     await this.waitForRateLimit({ remaining: 0, reset: rateLimit.reset });
   }
+}
+
+
+export function formatGitHubError(status: number, data: unknown): string {
+  const payload = data && typeof data === 'object' && data !== null ? data as Record<string, unknown> : undefined;
+  const message = payload && payload.message != null ? String(payload.message) : `HTTP ${status}`;
+  const errors = payload && Array.isArray(payload.errors) ? payload.errors : [];
+  const first = errors[0] && typeof errors[0] === 'object' && errors[0] !== null && 'message' in errors[0]
+    ? String((errors[0] as { message?: unknown }).message)
+    : undefined;
+  if (first && first.trim()) return `GitHub request failed: ${status} ${message}: ${first}`;
+  return `GitHub request failed: ${status} ${message}`;
 }
 
 function numberHeader(value: string | null): number | undefined {

@@ -1,9 +1,10 @@
 import {
   GitHubClient,
   addCommitDateWindow,
+  addIssueQualifier,
   applyLlmExtraction,
-  buildSearchQuery,
-  buildVendorQueryBundles,
+  buildCodeSearchQueries,
+  buildSearchQueries,
   dedupeCandidates,
   encodeQuery,
   extractPassOne,
@@ -147,9 +148,9 @@ async function scanCommitItems(
 }
 
 export async function scanFastLane(options: PollerOptions): Promise<void> {
-  const bundles = buildVendorQueryBundles(options.vendors, 7);
-  for (let index = 0; index < bundles.length; index += 1) {
-    const query = buildSearchQuery(bundles[index]);
+  const queries = buildSearchQueries(options.vendors);
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = queries[index];
     const queryKey = `fast:${index}`;
     for (const scan of [
       () => scanCommitSearch(options, query, queryKey, 'live'),
@@ -198,8 +199,9 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
   const cacheKey = `search:issues:${queryKey}`;
   const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, 'issues');
   if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
+  const issueQuery = addIssueQualifier(query, 'issue');
   const response = await options.github.request<SearchResponse<IssueSearchItem>>(
-    `/search/issues?q=${encodeQuery(query)}&sort=created&order=desc&per_page=${config.searchPageSize}`,
+    `/search/issues?q=${encodeQuery(issueQuery)}&sort=created&order=desc&per_page=${config.searchPageSize}`,
     { cacheKey }
   );
   const items = response.notModified ? [] : response.data?.items ?? [];
@@ -227,19 +229,16 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
 }
 
 export async function scanSlowLane(options: PollerOptions): Promise<void> {
-  const bundles = buildVendorQueryBundles(options.vendors, 7);
-  const pathQualifiers = ['filename:README.md', 'filename:PERKS.md', 'path:docs'];
-  for (let index = 0; index < bundles.length; index += 1) {
-    for (const qualifier of pathQualifiers) {
-      const query = `${buildSearchQuery(bundles[index])} ${qualifier}`;
-      const queryKey = `slow:${index}:${qualifier}`;
-      try {
-        await scanCodeSearch(options, query, queryKey);
-      } catch (error) {
-        log('query_scan_failed', { queryKey, error: error instanceof Error ? error.message : 'unknown' });
-      }
-      await sleep(6_500);
+  const queries = buildCodeSearchQueries(options.vendors);
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = queries[index];
+    const queryKey = `slow:${index}`;
+    try {
+      await scanCodeSearch(options, query, queryKey);
+    } catch (error) {
+      log('query_scan_failed', { queryKey, error: error instanceof Error ? error.message : 'unknown' });
     }
+    await sleep(6_500);
   }
 }
 
@@ -358,9 +357,9 @@ export async function scanHistoricalBackfill(options: PollerOptions): Promise<vo
   const window = previousWindow(lastWindow, config.backfillDaysPerWindow);
   if (new Date(window.end).getTime() < new Date(config.backfillStopDate).getTime()) return;
   const cursorWindow = `${window.start}..${window.end}`;
-  const bundles = buildVendorQueryBundles(options.vendors, 7);
-  for (let index = 0; index < bundles.length; index += 1) {
-    const query = addCommitDateWindow(buildSearchQuery(bundles[index]), window.start, window.end);
+  const queries = buildSearchQueries(options.vendors);
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = addCommitDateWindow(queries[index], window.start, window.end);
     try {
       await scanCommitSearch(options, query, `backfill:${index}`, 'backfill', cursorWindow);
     } catch (error) {
