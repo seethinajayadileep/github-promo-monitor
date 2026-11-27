@@ -1,24 +1,477 @@
 [
-  { "id": "apify", "name": "Apify", "category": "developer-tools", "domains": ["apify.com"], "keywords": ["Apify"] },
-  { "id": "openai", "name": "OpenAI", "category": "ai", "domains": ["openai.com", "platform.openai.com"], "keywords": ["OpenAI", "ChatGPT", "OpenAI API"] },
-  { "id": "anthropic", "name": "Anthropic", "category": "ai", "domains": ["anthropic.com", "console.anthropic.com"], "keywords": ["Anthropic", "Claude"] },
-  { "id": "firecrawl", "name": "Firecrawl", "category": "developer-tools", "domains": ["firecrawl.dev"], "keywords": ["Firecrawl"] },
-  { "id": "render", "name": "Render", "category": "cloud", "domains": ["render.com", "dashboard.render.com"], "keywords": ["Render"] },
-  { "id": "tavily", "name": "Tavily", "category": "ai", "domains": ["tavily.com"], "keywords": ["Tavily"] },
-  { "id": "elevenlabs", "name": "ElevenLabs", "category": "ai", "domains": ["elevenlabs.io"], "keywords": ["ElevenLabs", "Eleven Labs"] },
-  { "id": "replit", "name": "Replit", "category": "developer-tools", "domains": ["replit.com"], "keywords": ["Replit"] },
-  { "id": "modal", "name": "Modal", "category": "cloud", "domains": ["modal.com"], "keywords": ["Modal Labs", "Modal"] },
-  { "id": "groq", "name": "Groq", "category": "ai", "domains": ["groq.com", "console.groq.com"], "keywords": ["Groq", "GroqCloud"] },
-  { "id": "cloudflare", "name": "Cloudflare", "category": "cloud", "domains": ["cloudflare.com", "dash.cloudflare.com"], "keywords": ["Cloudflare", "Cloudflare Workers"] },
-  { "id": "pinecone", "name": "Pinecone", "category": "ai", "domains": ["pinecone.io", "app.pinecone.io"], "keywords": ["Pinecone"] },
-  { "id": "vercel", "name": "Vercel", "category": "cloud", "domains": ["vercel.com"], "keywords": ["Vercel"] },
-  { "id": "supabase", "name": "Supabase", "category": "developer-tools", "domains": ["supabase.com"], "keywords": ["Supabase"] },
-  { "id": "neon", "name": "Neon", "category": "developer-tools", "domains": ["neon.tech"], "keywords": ["Neon database", "Neon Postgres"] },
-  { "id": "github", "name": "GitHub", "category": "developer-tools", "domains": ["github.com", "education.github.com"], "keywords": ["GitHub Copilot", "GitHub Student Developer Pack"] },
-  { "id": "huggingface", "name": "Hugging Face", "category": "ai", "domains": ["huggingface.co"], "keywords": ["Hugging Face", "HuggingFace"] },
-  { "id": "langchain", "name": "LangChain", "category": "ai", "domains": ["langchain.com", "smith.langchain.com"], "keywords": ["LangChain", "LangSmith"] },
-  { "id": "mistral", "name": "Mistral AI", "category": "ai", "domains": ["mistral.ai", "console.mistral.ai"], "keywords": ["Mistral AI", "Mistral"] },
-  { "id": "perplexity", "name": "Perplexity", "category": "ai", "domains": ["perplexity.ai"], "keywords": ["Perplexity"] },
-  { "id": "sentry", "name": "Sentry", "category": "developer-tools", "domains": ["sentry.io"], "keywords": ["Sentry"] },
-  { "id": "postman", "name": "Postman", "category": "developer-tools", "domains": ["postman.com"], "keywords": ["Postman"] }
+  {
+    "id": "apify",
+    "name": "Apify",
+    "category": "developer-tools",
+    "domains": [
+      "apify.com"
+    ],
+    "keywords": [
+      "Apify"
+    ]
+  },
+  {
+    "id": "openai",
+    "name": "OpenAI",
+    "category": "ai",
+    "domains": [
+      "openai.com",
+      "platform.openai.com"
+    ],
+    "keywords": [
+      "OpenAI",
+      "ChatGPT",
+      "OpenAI API"
+    ]
+  },
+  {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "category": "ai",
+    "domains": [
+      "anthropic.com",
+      "console.anthropic.com"
+    ],
+    "keywords": [
+      "Anthropic",
+      "Claude"
+    ]
+  },
+  {
+    "id": "firecrawl",
+    "name": "Firecrawl",
+    "category": "developer-tools",
+    "domains": [
+      "firecrawl.dev"
+    ],
+    "keywords": [
+      "Firecrawl"
+    ]
+  },
+  {
+    "id": "render",
+    "name": "Render",
+    "category": "cloud",
+    "domains": [
+      "render.com",
+      "dashboard.render.com"
+    ],
+    "keywords": [
+      "Render"
+    ]
+  },
+  {
+    "id": "tavily",
+    "name": "Tavily",
+    "category": "ai",
+    "domains": [
+      "tavily.com"
+    ],
+    "keywords": [
+      "Tavily"
+    ]
+  },
+  {
+    "id": "elevenlabs",
+    "name": "ElevenLabs",
+    "category": "ai",
+    "domains": [
+      "elevenlabs.io"
+    ],
+    "keywords": [
+      "ElevenLabs",
+      "Eleven Labs"
+    ]
+  },
+  {
+    "id": "replit",
+    "name": "Replit",
+    "category": "developer-tools",
+    "domains": [
+      "replit.com"
+    ],
+    "keywords": [
+      "Replit"
+    ]
+  },
+  {
+    "id": "modal",
+    "name": "Modal",
+    "category": "cloud",
+    "domains": [
+      "modal.com"
+    ],
+    "keywords": [
+      "Modal Labs",
+      "Modal"
+    ]
+  },
+  {
+    "id": "groq",
+    "name": "Groq",
+    "category": "ai",
+    "domains": [
+      "groq.com",
+      "console.groq.com"
+    ],
+    "keywords": [
+      "Groq",
+      "GroqCloud"
+    ]
+  },
+  {
+    "id": "cloudflare",
+    "name": "Cloudflare",
+    "category": "cloud",
+    "domains": [
+      "cloudflare.com",
+      "dash.cloudflare.com"
+    ],
+    "keywords": [
+      "Cloudflare",
+      "Cloudflare Workers"
+    ]
+  },
+  {
+    "id": "pinecone",
+    "name": "Pinecone",
+    "category": "ai",
+    "domains": [
+      "pinecone.io",
+      "app.pinecone.io"
+    ],
+    "keywords": [
+      "Pinecone"
+    ]
+  },
+  {
+    "id": "vercel",
+    "name": "Vercel",
+    "category": "cloud",
+    "domains": [
+      "vercel.com"
+    ],
+    "keywords": [
+      "Vercel"
+    ]
+  },
+  {
+    "id": "supabase",
+    "name": "Supabase",
+    "category": "developer-tools",
+    "domains": [
+      "supabase.com"
+    ],
+    "keywords": [
+      "Supabase"
+    ]
+  },
+  {
+    "id": "neon",
+    "name": "Neon",
+    "category": "developer-tools",
+    "domains": [
+      "neon.tech"
+    ],
+    "keywords": [
+      "Neon database",
+      "Neon Postgres"
+    ]
+  },
+  {
+    "id": "github",
+    "name": "GitHub",
+    "category": "developer-tools",
+    "domains": [
+      "github.com",
+      "education.github.com"
+    ],
+    "keywords": [
+      "GitHub Copilot",
+      "GitHub Student Developer Pack"
+    ]
+  },
+  {
+    "id": "huggingface",
+    "name": "Hugging Face",
+    "category": "ai",
+    "domains": [
+      "huggingface.co"
+    ],
+    "keywords": [
+      "Hugging Face",
+      "HuggingFace"
+    ]
+  },
+  {
+    "id": "langchain",
+    "name": "LangChain",
+    "category": "ai",
+    "domains": [
+      "langchain.com",
+      "smith.langchain.com"
+    ],
+    "keywords": [
+      "LangChain",
+      "LangSmith"
+    ]
+  },
+  {
+    "id": "mistral",
+    "name": "Mistral AI",
+    "category": "ai",
+    "domains": [
+      "mistral.ai",
+      "console.mistral.ai"
+    ],
+    "keywords": [
+      "Mistral AI",
+      "Mistral"
+    ]
+  },
+  {
+    "id": "perplexity",
+    "name": "Perplexity",
+    "category": "ai",
+    "domains": [
+      "perplexity.ai"
+    ],
+    "keywords": [
+      "Perplexity"
+    ]
+  },
+  {
+    "id": "sentry",
+    "name": "Sentry",
+    "category": "developer-tools",
+    "domains": [
+      "sentry.io"
+    ],
+    "keywords": [
+      "Sentry"
+    ]
+  },
+  {
+    "id": "postman",
+    "name": "Postman",
+    "category": "developer-tools",
+    "domains": [
+      "postman.com"
+    ],
+    "keywords": [
+      "Postman"
+    ]
+  },
+  {
+    "id": "railway",
+    "name": "Railway",
+    "category": "cloud",
+    "domains": [
+      "railway.app",
+      "railway.com"
+    ],
+    "keywords": [
+      "Railway",
+      "Railway.app"
+    ]
+  },
+  {
+    "id": "digitalocean",
+    "name": "DigitalOcean",
+    "category": "cloud",
+    "domains": [
+      "digitalocean.com"
+    ],
+    "keywords": [
+      "DigitalOcean"
+    ]
+  },
+  {
+    "id": "flyio",
+    "name": "Fly.io",
+    "category": "cloud",
+    "domains": [
+      "fly.io"
+    ],
+    "keywords": [
+      "Fly.io"
+    ]
+  },
+  {
+    "id": "netlify",
+    "name": "Netlify",
+    "category": "cloud",
+    "domains": [
+      "netlify.com"
+    ],
+    "keywords": [
+      "Netlify"
+    ]
+  },
+  {
+    "id": "cursor",
+    "name": "Cursor",
+    "category": "ai",
+    "domains": [
+      "cursor.com",
+      "cursor.sh"
+    ],
+    "keywords": [
+      "Cursor Pro",
+      "Cursor AI",
+      "Cursor credits"
+    ]
+  },
+  {
+    "id": "lovable",
+    "name": "Lovable",
+    "category": "ai",
+    "domains": [
+      "lovable.dev"
+    ],
+    "keywords": [
+      "Lovable",
+      "lovable.dev"
+    ]
+  },
+  {
+    "id": "bolt",
+    "name": "Bolt.new",
+    "category": "ai",
+    "domains": [
+      "bolt.new",
+      "stackblitz.com"
+    ],
+    "keywords": [
+      "Bolt.new",
+      "StackBlitz"
+    ]
+  },
+  {
+    "id": "windsurf",
+    "name": "Windsurf",
+    "category": "ai",
+    "domains": [
+      "windsurf.com",
+      "codeium.com"
+    ],
+    "keywords": [
+      "Windsurf",
+      "Codeium"
+    ]
+  },
+  {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "category": "ai",
+    "domains": [
+      "openrouter.ai"
+    ],
+    "keywords": [
+      "OpenRouter"
+    ]
+  },
+  {
+    "id": "together",
+    "name": "Together AI",
+    "category": "ai",
+    "domains": [
+      "together.ai"
+    ],
+    "keywords": [
+      "Together AI",
+      "together.ai"
+    ]
+  },
+  {
+    "id": "exa",
+    "name": "Exa",
+    "category": "ai",
+    "domains": [
+      "exa.ai"
+    ],
+    "keywords": [
+      "Exa AI",
+      "exa.ai"
+    ]
+  },
+  {
+    "id": "browserbase",
+    "name": "Browserbase",
+    "category": "developer-tools",
+    "domains": [
+      "browserbase.com"
+    ],
+    "keywords": [
+      "Browserbase"
+    ]
+  },
+  {
+    "id": "e2b",
+    "name": "E2B",
+    "category": "developer-tools",
+    "domains": [
+      "e2b.dev"
+    ],
+    "keywords": [
+      "E2B",
+      "e2b.dev"
+    ]
+  },
+  {
+    "id": "mongodb",
+    "name": "MongoDB Atlas",
+    "category": "developer-tools",
+    "domains": [
+      "mongodb.com"
+    ],
+    "keywords": [
+      "MongoDB Atlas",
+      "MongoDB"
+    ]
+  },
+  {
+    "id": "upstash",
+    "name": "Upstash",
+    "category": "developer-tools",
+    "domains": [
+      "upstash.com"
+    ],
+    "keywords": [
+      "Upstash"
+    ]
+  },
+  {
+    "id": "clerk",
+    "name": "Clerk",
+    "category": "developer-tools",
+    "domains": [
+      "clerk.com"
+    ],
+    "keywords": [
+      "Clerk"
+    ]
+  },
+  {
+    "id": "resend",
+    "name": "Resend",
+    "category": "developer-tools",
+    "domains": [
+      "resend.com"
+    ],
+    "keywords": [
+      "Resend"
+    ]
+  },
+  {
+    "id": "jetbrains",
+    "name": "JetBrains",
+    "category": "developer-tools",
+    "domains": [
+      "jetbrains.com"
+    ],
+    "keywords": [
+      "JetBrains"
+    ]
+  }
 ]
