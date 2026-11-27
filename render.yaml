@@ -1,0 +1,70 @@
+databases:
+  - name: promo-db
+    databaseName: promo_monitor
+    user: promo_monitor
+    plan: free
+
+services:
+  - type: worker
+    name: promo-worker
+    runtime: node
+    plan: 0.5c-512mb
+    rootDir: .
+    buildCommand: npm ci && npm run build:worker
+    preDeployCommand: npm run migrate
+    startCommand: npm run start:worker
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: promo-db
+          property: connectionString
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_TOKENS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: SLACK_WEBHOOK_URL
+        sync: false
+      - key: SMTP_URL
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+      - key: FAST_LANE_INTERVAL_MS
+        value: "90000"
+      - key: SLOW_LANE_INTERVAL_MS
+        value: "1200000"
+      - key: WATCHLIST_INTERVAL_MS
+        value: "300000"
+      - key: BACKFILL_ENABLED
+        value: "true"
+      - key: APP_ENV
+        value: production
+
+  - type: web
+    name: promo-dashboard
+    runtime: node
+    plan: 0.5c-512mb
+    rootDir: .
+    buildCommand: npm ci && npm run build:dashboard
+    startCommand: npm run start:dashboard
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: promo-db
+          property: connectionString
+      - key: ADMIN_SECRET
+        sync: false
+      - key: APP_ENV
+        value: production

@@ -1,0 +1,23 @@
+{
+  "name": "github-promo-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/shared",
+    "packages/worker",
+    "packages/dashboard"
+  ],
+  "scripts": {
+    "build": "npm run build -w @promo/shared && npm run build -w @promo/worker && npm run build -w @promo/dashboard",
+    "build:worker": "npm run build -w @promo/shared && npm run build -w @promo/worker",
+    "build:dashboard": "npm run build -w @promo/shared && npm run build -w @promo/dashboard",
+    "test": "npm run test -w @promo/shared",
+    "migrate": "node scripts/migrate.mjs",
+    "start:worker": "node packages/worker/dist/index.js",
+    "start:dashboard": "npm run start -w @promo/dashboard"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
