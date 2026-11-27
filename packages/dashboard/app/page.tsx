@@ -7,7 +7,6 @@ export const dynamic = 'force-dynamic';
 
 const PAGE_SIZE = 50;
 const sourceTypes = ['code', 'commit', 'issue', 'watchlist'];
-const confidenceLevels = ['high', 'medium', 'low'];
 const statuses = ['active', 'unverified', 'likely_expired', 'expired', 'flagged'];
 
 function formatIstDateTime(value: string | Date): string {
@@ -122,11 +121,21 @@ export default async function DashboardPage({ searchParams }: { searchParams: Re
         <Select name="vendor" value={filters.vendor} values={filterValues.vendors} label="Vendor" />
         <Select name="category" value={filters.category} values={filterValues.categories} label="Category" />
         <Select name="sourceType" value={filters.sourceType} values={sourceTypes} label="Source" />
-        <Select name="confidence" value={filters.confidence} values={confidenceLevels} label="Confidence" />
+        <label className="flex min-w-36 flex-col gap-1 text-xs text-slate-400">
+          Confidence
+          <select name="confidence" defaultValue={filters.confidence}>
+            <option value="">High & medium</option>
+            <option value="high">high</option>
+            <option value="medium">medium</option>
+            <option value="low">low</option>
+            <option value="all">All (incl. low)</option>
+          </select>
+        </label>
         <Select name="status" value={filters.status} values={statuses} label="Status" />
         <label className="flex flex-col gap-1 text-xs text-slate-400">
           Sort
-          <select name="sort" defaultValue={filters.sort || 'newest'}>
+          <select name="sort" defaultValue={filters.sort || 'confidence'}>
+            <option value="confidence">High first</option>
             <option value="newest">Newest</option>
             <option value="sightings">Most sightings</option>
           </select>

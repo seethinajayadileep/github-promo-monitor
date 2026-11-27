@@ -3,13 +3,12 @@ import {
   GitHubClient,
   addCommitDateWindow,
   addIssueQualifier,
-  applyLlmExtraction,
   buildCodeSearchQueries,
   buildSearchQueries,
   dedupeCandidates,
   encodeQuery,
+  enrichAndGateCandidates,
   extractPassOne,
-  extractWithLlm,
   insertScanRun,
   latestBackfillWindow,
   latestEtag,
@@ -67,20 +66,6 @@ function dateOrUndefined(value?: string): Date | undefined {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
-async function enrichCandidates(candidates: PromoCandidate[], vendors: VendorConfig[]): Promise<PromoCandidate[]> {
-  const enriched: PromoCandidate[] = [];
-  for (const candidate of candidates.slice(0, 10)) {
-    try {
-      const llm = await extractWithLlm(candidate.snippet, vendors);
-      const applied = applyLlmExtraction(candidate, llm, vendors);
-      if (applied) enriched.push(applied);
-    } catch {
-      enriched.push(candidate);
-    }
-  }
-  return enriched;
-}
-
 function rateLimitFields(rateLimit: RateLimitState): { rateLimitRemaining?: number; rateLimitLimit?: number; rateLimitResource?: string } {
   return {
     rateLimitRemaining: rateLimit.remaining,
@@ -104,7 +89,7 @@ async function ingestText(
 ): Promise<number> {
   const passOne = extractPassOne({ ...input, vendors });
   if (!passOne.candidates.length) return 0;
-  const candidates = dedupeCandidates(await enrichCandidates(passOne.candidates, vendors));
+  const candidates = dedupeCandidates(await enrichAndGateCandidates(passOne.candidates, vendors, log));
   let newCodes = 0;
   for (const candidate of candidates) {
     const result = await upsertPromoCandidate(pool, candidate);

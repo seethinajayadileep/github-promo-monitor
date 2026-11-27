@@ -144,6 +144,23 @@ export interface DashboardFilters {
   offset?: number;
 }
 
+export type NormalizedConfidenceFilter = 'high' | 'medium' | 'low' | 'all' | 'high-medium';
+
+/** Empty/missing confidence defaults to high+medium; `all` includes low rows. */
+export function normalizeConfidenceFilter(confidence?: string): NormalizedConfidenceFilter {
+  if (!confidence) return 'high-medium';
+  if (confidence === 'all' || confidence === 'high' || confidence === 'medium' || confidence === 'low') return confidence;
+  return 'high-medium';
+}
+
+export function promoSortClause(sort?: string): string {
+  if (sort === 'sightings') return 'sighting_count DESC, last_seen_at DESC, id DESC';
+  if (sort === 'confidence') {
+    return "CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, last_seen_at DESC, id DESC";
+  }
+  return 'last_seen_at DESC, id DESC';
+}
+
 function buildPromoFilters(filters: DashboardFilters): { whereSql: string; params: unknown[] } {
   const where: string[] = [];
   const params: unknown[] = [];
@@ -158,14 +175,16 @@ function buildPromoFilters(filters: DashboardFilters): { whereSql: string; param
   if (filters.vendor) add('lower(vendor) = lower(?)', filters.vendor);
   if (filters.category) add('category = ?', filters.category);
   if (filters.sourceType) add('source_type = ?', filters.sourceType);
-  if (filters.confidence) add('confidence = ?', filters.confidence);
+  const confidence = normalizeConfidenceFilter(filters.confidence);
+  if (confidence === 'high-medium') where.push("confidence IN ('high', 'medium')");
+  else if (confidence !== 'all') add('confidence = ?', confidence);
   if (filters.status) add('status = ?', filters.status);
   return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
 }
 
 export async function queryPromoCodes(pool: pg.Pool, filters: DashboardFilters): Promise<PromoCodeRow[]> {
   const { whereSql, params } = buildPromoFilters(filters);
-  const sort = filters.sort === 'sightings' ? 'sighting_count DESC, last_seen_at DESC' : 'last_seen_at DESC, id DESC';
+  const sort = promoSortClause(filters.sort || 'confidence');
   params.push(Math.min(filters.limit ?? 100, 200));
   const limitParam = params.length;
   params.push(filters.offset ?? 0);

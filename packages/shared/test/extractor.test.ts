@@ -3,6 +3,7 @@ import {
   applyLlmExtraction,
   buildSarvamChatRequest,
   configuredLlmProvider,
+  enrichAndGateCandidates,
   extractPassOne,
   extractWithLlm,
   isRejectedCodeToken,
@@ -110,6 +111,55 @@ describe('stage 3 pass-one extractor', () => {
     const text = 'RANDOMCODE appears in this paragraph about logging.\n\nSee the OpenAI docs at https://platform.openai.com/docs for details.';
     expect(extract(text).candidates.map((item) => item.code)).not.toContain('RANDOMCODE');
   });
+
+  it('rejects env-var names and generic hyphenated English or UI phrases', () => {
+    const rejected = [
+      'ELEVENLABS_API_KEY', 'ADMIN_ACCESS_TOKEN', 'DISCOUNT_CODE', 'FOUNDING_COUPON_ID',
+      'NEW_ID', 'ELEVENLABS_VOICE_ID', 'CROSS-BROWSER', 'SINGLE-FILE', 'STEP-BY-STEP',
+      'SPEECH-TO-TEXT', 'POST-RULING', 'ALREADY-FIXED', 'STOREFRONT-WEB', 'REVIEW-JUMP',
+      'ONE-USE', 'MODEL-VIEWER', 'COUPON-CODES', 'PROP-FIRM', 'TEXT-TO-SPEECH',
+      'GET-STARTED', 'SIGN-UP', 'LOG-IN', 'CHECK-OUT', 'FREE-TIER', 'FREE-TRIAL',
+      'PRO-PLAN', 'PROMO-CODE', 'CREDIT-CODE', 'GIFT-CARD', 'NO-CODE', 'LOW-CODE',
+      'AI-POWERED', 'CLOUD-NATIVE', 'ZERO-SHOT', 'FEW-SHOT', 'FINE-TUNE', 'MULTI-AGENT',
+      'RATE-LIMIT', 'AUTO-DEPLOY', 'DARK-MODE', 'LIGHT-MODE', 'WEB-APP', 'MOBILE-APP',
+      'API-KEY', 'ACCESS-TOKEN', 'OPEN-SOURCE', 'SELF-HOSTED', 'TIME-LIMITED',
+      'FULL-STACK', 'FRONT-END', 'BACK-END', 'SERVER-SIDE', 'CLIENT-SIDE', 'END-TO-END',
+      'ITEMS-CENTER'
+    ];
+    for (const token of rejected) {
+      expect(isRejectedCodeToken(token), token).toBe(true);
+    }
+    const kept = [
+      'APIFY_CAL_HACKS', 'BOLTJUDGES100', 'SPONS-BASETEN-2026', 'NEBIUS-DEVPOST-GLOBAL26',
+      'CLAUDE_CAMPUS_2026', 'NEON20', 'VTHACKS', 'SDRAGENTLOOP', 'BF2025', 'APRIL-2026',
+      'GITHUBISP', 'VERCELTICSBETA', 'TOPDEADYT20', 'HACK-NATION'
+    ];
+    for (const token of kept) {
+      expect(isRejectedCodeToken(token), token).toBe(false);
+    }
+  });
+
+  it('does not extract env-var or English-phrase tokens even with promo cues', () => {
+    const text = [
+      'Use code ELEVENLABS_API_KEY for OpenAI credits.',
+      'Use code ADMIN_ACCESS_TOKEN for OpenAI credits.',
+      'Use code DISCOUNT_CODE for OpenAI credits.',
+      'Use code FOUNDING_COUPON_ID for OpenAI credits.',
+      'Use code CROSS-BROWSER for OpenAI credits.',
+      'Use code SINGLE-FILE for OpenAI credits.',
+      'Use code STEP-BY-STEP for OpenAI credits at https://platform.openai.com/'
+    ].join('\n');
+    expect(extract(text).candidates.map((item) => item.code)).toEqual([]);
+  });
+
+  it('still extracts genuine public promo codes', () => {
+    expect(extract('Hackathon credits: use code APIFY_CAL_HACKS for Apify free credits. Redeem at https://apify.com/ before 2026-12-31').candidates[0]).toMatchObject({
+      vendor: 'Apify',
+      code: 'APIFY_CAL_HACKS'
+    });
+    const text = 'Use code HACK-NATION for OpenAI free credits. Use code BOLTJUDGES100 for OpenAI free credits. Use code APRIL-2026 for OpenAI free credits.';
+    expect(extract(text).candidates.map((item) => item.code)).toEqual(expect.arrayContaining(['HACK-NATION', 'BOLTJUDGES100', 'APRIL-2026']));
+  });
 });
 
 describe('LLM extraction helpers', () => {
@@ -189,6 +239,89 @@ describe('LLM extraction helpers', () => {
       expect(llm).toEqual({ isPublicPromo: false });
       expect(applyLlmExtraction(sampleCandidate, llm, vendors)).toBeNull();
       expect(payloads[0]).toMatchObject({ model: 'sarvam-105b', stream: false, reasoning_effort: 'low', max_tokens: 1536 });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('keeps Pass-1 candidates unchanged when no LLM provider is configured', async () => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    const result = await enrichAndGateCandidates([sampleCandidate], vendors, (event, details) => events.push([event, details]));
+    expect(result).toHaveLength(1);
+    expect(result[0].code).toBe('BSD-3-CLAUSE');
+    expect(events).toEqual([]);
+  });
+
+  it('drops every candidate the LLM rejects and skips when a configured LLM errors', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const originalFetch = globalThis.fetch;
+    const rejected = { ...sampleCandidate, code: 'CROSS-BROWSER', snippet: 'GATE_REJECT: CROSS-BROWSER is just a phrase.' };
+    const approved = { ...sampleCandidate, code: 'TEMP', snippet: 'GATE_APPROVE: Use code APIFY_CAL_HACKS for Apify credits.' };
+    const failed = { ...sampleCandidate, code: 'SHOULD_SKIP', snippet: 'GATE_FAIL: should not be inserted.' };
+    let calls = 0;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      calls += 1;
+      const body = String(init?.body);
+      if (body.includes('GATE_FAIL')) throw new Error('sarvam timeout');
+      if (body.includes('GATE_REJECT')) {
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: '{"is_public_promo":false,"vendor":null,"code":null}' } }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"is_public_promo":true,"vendor":"Apify","code":"APIFY_CAL_HACKS","offer_summary":"$200 in credits","redeem_url":null,"expires_at":null,"confidence":"high"}' } }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const events: Array<[string, Record<string, unknown>]> = [];
+      const result = await enrichAndGateCandidates(
+        [rejected, approved, failed],
+        vendors,
+        (event, details) => events.push([event, details])
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({ code: 'APIFY_CAL_HACKS', confidence: 'high' });
+      expect(events).toEqual(expect.arrayContaining([
+        ['llm_gate_rejected', expect.objectContaining({ code: 'CROSS-BROWSER' })],
+        ['llm_gate_failed', expect.objectContaining({ code: 'SHOULD_SKIP' })]
+      ]));
+      expect(calls).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('skips the candidate when a configured LLM returns an empty or unparseable response', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      choices: [{ message: { content: '' } }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+    try {
+      const events: Array<[string, Record<string, unknown>]> = [];
+      const result = await enrichAndGateCandidates([sampleCandidate], vendors, (event, details) => events.push([event, details]));
+      expect(result).toEqual([]);
+      expect(events).toEqual([['llm_gate_failed', expect.objectContaining({ code: 'BSD-3-CLAUSE', reason: 'empty-or-timeout' })]]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('sends every Pass-1 candidate through the configured LLM gate, not just a subset', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"is_public_promo":false,"vendor":null,"code":null}' } }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const many = Array.from({ length: 12 }, (_, index) => ({ ...sampleCandidate, code: `CODE${index}` }));
+      const result = await enrichAndGateCandidates(many, vendors);
+      expect(calls).toBe(12);
+      expect(result).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }

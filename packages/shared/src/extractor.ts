@@ -36,7 +36,36 @@ const GENERIC_COMPOUND_CODES = new Set([
   'PRODUCTION-READY', 'CROSS-PLATFORM', 'TYPE-SAFE', 'FULL-STACK', 'FRONT-END', 'BACK-END', 'CLIENT-SIDE',
   'SERVER-SIDE', 'PRE-COMMIT', 'POST-COMMIT', 'CI-CD', 'NODE-JS', 'NEXT-JS', 'WELL-KNOWN', 'COPY-PASTE',
   'DROP-IN', 'OPT-IN', 'OPT-OUT', 'NON-COMMERCIAL', 'TRADE-OFF', 'BEST-PRACTICE', 'GET-STARTED', 'QUICK-START',
-  'README-MD', 'LICENSE-MD', 'LEFT-HAND', 'RIGHT-HAND'
+  'README-MD', 'LICENSE-MD', 'LEFT-HAND', 'RIGHT-HAND', 'CROSS-BROWSER', 'SINGLE-FILE', 'STEP-BY-STEP',
+  'SPEECH-TO-TEXT', 'TEXT-TO-SPEECH', 'POST-RULING', 'ALREADY-FIXED', 'STOREFRONT-WEB', 'REVIEW-JUMP',
+  'ONE-USE', 'MODEL-VIEWER', 'COUPON-CODES', 'PROP-FIRM', 'SIGN-UP', 'LOG-IN', 'CHECK-OUT', 'FREE-TIER',
+  'FREE-TRIAL', 'PRO-PLAN', 'PROMO-CODE', 'CREDIT-CODE', 'GIFT-CARD', 'NO-CODE', 'LOW-CODE', 'AI-POWERED',
+  'CLOUD-NATIVE', 'ZERO-SHOT', 'FEW-SHOT', 'FINE-TUNE', 'MULTI-AGENT', 'AUTO-DEPLOY', 'DARK-MODE',
+  'LIGHT-MODE', 'WEB-APP', 'MOBILE-APP', 'API-KEY', 'ACCESS-TOKEN', 'AS-BUILT', 'UPSTREAM-QUALIFIED',
+  'MAKE-PROMO-CODE'
+]);
+
+const ENV_VAR_SUFFIXES = [
+  'API_KEY', 'ACCESS_TOKEN', 'TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'ID', 'CODE', 'URL', 'URI', 'KEY',
+  'HOST', 'PORT', 'ENV', 'PATH', 'DIR', 'MODE', 'FLAG', 'NAME', 'TYPE', 'VALUE', 'CONFIG', 'HEADER',
+  'ENDPOINT', 'BUCKET', 'REGION', 'CLIENT', 'SERVER', 'WEBHOOK', 'AUTH', 'CREDENTIAL', 'SESSION',
+  'COOKIE', 'HASH', 'SALT', 'NONCE', 'PREFIX', 'SUFFIX'
+];
+
+const ENV_VAR_NAME_PATTERN = new RegExp(
+  `^(?:[A-Z][A-Z0-9]*_)+(?:${ENV_VAR_SUFFIXES.join('|')})$|^(?:${ENV_VAR_SUFFIXES.join('|')})$`
+);
+
+const GENERIC_HYPHEN_SUFFIX_PATTERN = /^(?:[A-Z]+-)+(?:BROWSER|FILE|WEB|VIEWER|CODES?|FIRM|HOSTED|SOURCE|LIMITED|STACK|TIER|TRIAL|PLAN|CARD|POWERED|NATIVE|SHOT|TUNE|AGENT|LIMIT|DEPLOY|MODE|APP|KEY|TOKEN|UP|IN|OUT|STARTED|RULING|FIXED|JUMP|USE|END|SIDE|PLATFORM|COMMIT|READY|SAFE|COMMERCIAL|PRACTICE|KNOWN|PASTE|HAND|JS|MD|QUALIFIED|BUILT)$/i;
+const GENERIC_HYPHEN_BRIDGE_PATTERN = /^(?:[A-Z]+-)+(?:TO|BY|FOR)-[A-Z]+(?:-[A-Z]+)*$/i;
+
+const CSS_UI_PARTS = new Set([
+  'ITEMS', 'CENTER', 'FLEX', 'GRID', 'COL', 'COLS', 'ROW', 'ROWS', 'SPAN', 'HIDDEN', 'BLOCK', 'INLINE',
+  'STICKY', 'FIXED', 'RELATIVE', 'ABSOLUTE', 'WRAP', 'GROW', 'SHRINK', 'AUTO', 'FULL', 'SCREEN',
+  'JUSTIFY', 'CONTENT', 'SELF', 'PLACE', 'GAP', 'SPACE', 'PADDING', 'MARGIN', 'BORDER', 'ROUNDED',
+  'SHADOW', 'OPACITY', 'FONT', 'TEXT', 'BG', 'COLOR', 'WIDTH', 'HEIGHT', 'MIN', 'MAX', 'OVERFLOW',
+  'SCROLL', 'VISIBLE', 'POINTER', 'CURSOR', 'SELECT', 'ALIGN', 'LEADING', 'TRACKING', 'UPPERCASE',
+  'LOWERCASE', 'TRUNCATE', 'SR', 'ONLY'
 ]);
 
 const LICENSE_CODE_PATTERN = /^(?:BSD-\d+-CLAUSE|MIT-LICENSE|APACHE-?\d+(?:\.\d+)?|GPL-?(?:V)?\d+(?:\.\d+)?|LGPL-?(?:V)?\d+|AGPL-?(?:V)?\d+|MPL-?\d+(?:\.\d+)?|CC-BY(?:-[A-Z0-9]+)*|UNLICENSE)$/i;
@@ -47,7 +76,7 @@ export const SARVAM_DEFAULT_URL = 'https://api.sarvam.ai/v2/chat/completions';
 export const SARVAM_DEFAULT_MODEL = 'sarvam-105b';
 export const SARVAM_MAX_TOKENS = 1536;
 
-const LLM_SYSTEM_PROMPT = 'Extract only intentionally public SaaS/AI/developer-tool promotional codes. Never output credentials. Return strict JSON.';
+const LLM_SYSTEM_PROMPT = 'Extract only intentionally public, actionable SaaS/AI/developer-tool promotional, coupon, or credit codes a person can redeem. Never output credentials. Reject environment-variable and identifier names (ELEVENLABS_API_KEY, DISCOUNT_CODE, ADMIN_ACCESS_TOKEN, or tokens ending in _ID, _TOKEN, _KEY, _SECRET, _CODE), placeholder strings (YOUR_CODE_HERE, PROMO123), CSS/UI tokens, license IDs, CVEs, and generic English or hyphenated tech phrases (CROSS-BROWSER, STEP-BY-STEP, OPEN-SOURCE, SINGLE-FILE). Return strict JSON.';
 
 export interface PassOneInput {
   text: string;
@@ -129,11 +158,24 @@ function cleanCode(raw: string): string {
   return canonicalCode(raw).replace(/^[-_]+|[-_]+$/g, '');
 }
 
+function isCssUiCompound(token: string): boolean {
+  if (!token.includes('-') || /\d/.test(token)) return false;
+  const parts = token.split('-').filter(Boolean);
+  return parts.length >= 2 && parts.every((part) => CSS_UI_PARTS.has(part));
+}
+
+export function isEnvVarOrIdentifierName(raw: string): boolean {
+  return ENV_VAR_NAME_PATTERN.test(raw.toUpperCase());
+}
+
 export function isRejectedCodeToken(raw: string): boolean {
   const token = raw.toUpperCase();
   if (GENERIC_COMPOUND_CODES.has(token)) return true;
+  if (isEnvVarOrIdentifierName(token)) return true;
   if (LICENSE_CODE_PATTERN.test(token) || CVE_CODE_PATTERN.test(token) || TECH_PREFIX_PATTERN.test(token)) return true;
   if (/^HTTPS?-/i.test(token)) return true;
+  if (GENERIC_HYPHEN_BRIDGE_PATTERN.test(token) || GENERIC_HYPHEN_SUFFIX_PATTERN.test(token)) return true;
+  if (isCssUiCompound(token)) return true;
   return false;
 }
 
@@ -307,7 +349,8 @@ function llmPrompt(text: string, vendors: VendorConfig[]): string {
   const vendorList = vendors.map((vendor) => `${vendor.name} (${vendor.domains.join(', ')})`).join('; ');
   return `Classify and extract the public promo in this text. Vendors: ${vendorList}.\n` +
     'Return exactly this JSON shape: {"is_public_promo":boolean,"vendor":string|null,"code":string|null,"offer_summary":string|null,"redeem_url":string|null,"expires_at":string|null,"confidence":"high"|"medium"|"low"}. ' +
-    'Set is_public_promo=false unless the text intentionally shares a public promo/coupon/credit code for a SaaS, AI, or developer tool.\n\nText:\n' + text.slice(0, 6000);
+    'Set is_public_promo=true only when the text intentionally shares a real, actionable public promo, coupon, or credit code for a SaaS, AI, or developer tool. ' +
+    'Set is_public_promo=false for environment variable or identifier names (ELEVENLABS_API_KEY, DISCOUNT_CODE, *_ID, *_TOKEN, *_KEY, *_SECRET), placeholders (YOUR_CODE_HERE, PROMO123), CSS/UI tokens, and generic English or hyphenated phrases.\n\nText:\n' + text.slice(0, 6000);
 }
 
 async function callSarvam(prompt: string): Promise<string | null> {
@@ -380,8 +423,10 @@ export async function extractWithLlm(text: string, vendors: VendorConfig[]): Pro
 }
 
 /**
- * Apply Pass-2 LLM results. Unconfigured/inconclusive results keep the Pass-1 candidate.
+ * Apply Pass-2 LLM results.
  * An explicit rejection (`is_public_promo=false` or missing code) drops the candidate.
+ * A null result is inconclusive: unconfigured callers may keep the Pass-1 candidate,
+ * but a configured LLM gate must drop it instead of inserting unverified noise.
  */
 export function applyLlmExtraction(candidate: PromoCandidate, llm: ExtractedPromo | null, vendors: VendorConfig[]): PromoCandidate | null {
   if (!llm) return candidate;
@@ -397,4 +442,47 @@ export function applyLlmExtraction(candidate: PromoCandidate, llm: ExtractedProm
     expiresAt: llm.expiresAt ?? candidate.expiresAt,
     confidence: llm.confidence ?? candidate.confidence
   };
+}
+
+export interface LlmGateEvent {
+  event: 'llm_gate_rejected' | 'llm_gate_failed';
+  vendor: string;
+  code: string;
+  reason?: string;
+}
+
+/**
+ * When an LLM provider is configured, every Pass-1 candidate must be validated
+ * before insert. Rejections, empty/timed-out responses, and thrown errors all drop
+ * the candidate. If no LLM is configured, Pass-1 candidates are returned unchanged.
+ */
+export async function enrichAndGateCandidates(
+  candidates: PromoCandidate[],
+  vendors: VendorConfig[],
+  onEvent?: (event: string, details: Record<string, unknown>) => void
+): Promise<PromoCandidate[]> {
+  if (configuredLlmProvider() === 'none') return candidates;
+  const enriched: PromoCandidate[] = [];
+  for (const candidate of candidates) {
+    try {
+      const llm = await extractWithLlm(candidate.snippet, vendors);
+      if (!llm) {
+        onEvent?.('llm_gate_failed', { vendor: candidate.vendor, code: candidate.code, reason: 'empty-or-timeout' });
+        continue;
+      }
+      const applied = applyLlmExtraction(candidate, llm, vendors);
+      if (!applied) {
+        onEvent?.('llm_gate_rejected', { vendor: candidate.vendor, code: candidate.code });
+        continue;
+      }
+      enriched.push(applied);
+    } catch (error) {
+      onEvent?.('llm_gate_failed', {
+        vendor: candidate.vendor,
+        code: candidate.code,
+        reason: error instanceof Error ? error.message : 'unknown'
+      });
+    }
+  }
+  return enriched;
 }
