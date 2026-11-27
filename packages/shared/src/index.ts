@@ -8,3 +8,4 @@ export * from './db.js';
 export * from './queryPlanner.js';
 export * from './github.js';
 export * from './notifier.js';
+export * from './urls.js';

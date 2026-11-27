@@ -3,12 +3,15 @@ import {
   GitHubClient,
   addCommitDateWindow,
   addIssueQualifier,
+  addRecentCommitDateWindow,
+  advanceLaneCursor,
   buildCodeSearchQueries,
   buildSearchQueries,
   dedupeCandidates,
   encodeQuery,
   enrichAndGateCandidates,
   extractPassOne,
+  getLaneCursor,
   insertScanRun,
   latestBackfillWindow,
   latestEtag,
@@ -48,10 +51,6 @@ interface IngestResult {
 
 function log(event: string, details: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ event, at: new Date().toISOString(), ...details }));
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function repoFromRepositoryUrl(repositoryUrl?: string): string {
@@ -145,11 +144,15 @@ async function scanCommitItems(
 
 export async function scanFastLane(options: PollerOptions): Promise<void> {
   const queries = buildSearchQueries(options.vendors);
-  for (let index = 0; index < queries.length; index += 1) {
-    const query = queries[index];
-    const queryKey = `fast:${index}`;
+  if (!queries.length) return;
+  const cursor = await getLaneCursor(options.pool, 'fast');
+  const index = cursor % queries.length;
+  const query = queries[index];
+  const queryKey = `fast:${index}`;
+  try {
+    const commitQuery = addRecentCommitDateWindow(query, config.liveCommitWindowDays);
     for (const scan of [
-      () => scanCommitSearch(options, query, queryKey, 'live'),
+      () => scanCommitSearch(options, commitQuery, queryKey, 'live'),
       () => scanIssueSearch(options, query, queryKey, 'live')
     ]) {
       try {
@@ -158,7 +161,26 @@ export async function scanFastLane(options: PollerOptions): Promise<void> {
         log('query_scan_failed', { queryKey, error: error instanceof Error ? error.message : 'unknown' });
       }
     }
+  } finally {
+    await advanceLaneCursor(options.pool, 'fast', (index + 1) % queries.length);
   }
+}
+
+interface CommitScanResult extends IngestResult {
+  complete: boolean;
+  pagesScanned: number;
+}
+
+function uniqueCommitItems(items: CommitSearchItem[]): CommitSearchItem[] {
+  const seen = new Set<string>();
+  const unique: CommitSearchItem[] = [];
+  for (const item of items) {
+    const key = item.sha || item.html_url;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+  }
+  return unique;
 }
 
 async function scanCommitSearch(
@@ -167,28 +189,60 @@ async function scanCommitSearch(
   queryKey: string,
   mode: ScanMode,
   cursorWindow?: string
-): Promise<IngestResult> {
-  const cacheKey = `search:commits:${queryKey}:${cursorWindow ?? 'latest'}`;
-  const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, `commits-${cursorWindow ?? 'latest'}`);
-  if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
-  const response = await options.github.request<SearchResponse<CommitSearchItem>>(
-    `/search/commits?q=${encodeQuery(query)}&sort=committer-date&order=desc&per_page=${config.searchPageSize}`,
-    { cacheKey, accept: 'application/vnd.github+json' }
-  );
-  const items = response.notModified ? [] : response.data?.items ?? [];
+): Promise<CommitScanResult> {
+  const allItems: CommitSearchItem[] = [];
+  let pagesScanned = 0;
+  let totalCount = 0;
+  let complete = true;
+  let lastResponse: Awaited<ReturnType<GitHubClient['request']>> | undefined;
+
+  for (let page = 1; page <= config.maxCommitSearchPages; page += 1) {
+    const cacheKey = `search:commits:${queryKey}:${cursorWindow ?? 'latest'}:page1`;
+    const useEtag = page === 1 && mode === 'live';
+    if (useEtag) {
+      const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, `commits-${cursorWindow ?? 'latest'}`);
+      if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
+    }
+    const response = await options.github.request<SearchResponse<CommitSearchItem>>(
+      `/search/commits?q=${encodeQuery(query)}&sort=committer-date&order=desc&per_page=${config.searchPageSize}&page=${page}`,
+      useEtag ? { cacheKey, accept: 'application/vnd.github+json' } : { accept: 'application/vnd.github+json' }
+    );
+    lastResponse = response;
+    pagesScanned += 1;
+    const items = response.notModified ? [] : response.data?.items ?? [];
+    totalCount = response.data?.total_count ?? totalCount;
+    allItems.push(...items);
+    if (response.notModified || items.length < config.searchPageSize) break;
+    const scannedCount = uniqueCommitItems(allItems).length;
+    if (totalCount > 0 && scannedCount >= Math.min(totalCount, 1000)) break;
+    if (page === config.maxCommitSearchPages) {
+      complete = totalCount > 0 ? scannedCount >= Math.min(totalCount, 1000) : false;
+    }
+  }
+
+  const items = uniqueCommitItems(allItems);
   const newCodes = await scanCommitItems(options, items, mode);
   await insertScanRun(options.pool, {
     queryKey,
     surface: `commits-${cursorWindow ?? 'latest'}`,
     mode,
     cursorWindow,
-    etag: response.etag,
-    hitsFound: response.data?.total_count ?? items.length,
+    etag: lastResponse?.etag,
+    hitsFound: items.length,
     newCodes,
-    ...rateLimitFields(response.rateLimit)
+    ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
-  await options.github.paceIfNeeded(response.rateLimit, mode === 'backfill' ? config.minimumRateLimitPercent : config.liveMinimumRateLimitPercent);
-  return { hitsFound: items.length, newCodes, rateLimitRemaining: response.rateLimit.remaining, etag: response.etag };
+  if (lastResponse) {
+    await options.github.paceIfNeeded(lastResponse.rateLimit, mode === 'backfill' ? config.minimumRateLimitPercent : config.liveMinimumRateLimitPercent);
+  }
+  return {
+    hitsFound: items.length,
+    newCodes,
+    rateLimitRemaining: lastResponse?.rateLimit.remaining,
+    etag: lastResponse?.etag,
+    complete,
+    pagesScanned
+  };
 }
 
 async function scanIssueSearch(options: PollerOptions, query: string, queryKey: string, mode: ScanMode): Promise<IngestResult> {
@@ -216,7 +270,7 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
     surface: 'issues',
     mode,
     etag: response.etag,
-    hitsFound: response.data?.total_count ?? items.length,
+    hitsFound: items.length,
     newCodes,
     ...rateLimitFields(response.rateLimit)
   });
@@ -226,34 +280,65 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
 
 export async function scanSlowLane(options: PollerOptions): Promise<void> {
   const queries = buildCodeSearchQueries(options.vendors);
-  for (let index = 0; index < queries.length; index += 1) {
-    const query = queries[index];
-    const queryKey = `slow:${index}`;
+  if (!queries.length) return;
+  const cursor = await getLaneCursor(options.pool, 'slow');
+  const index = cursor % queries.length;
+  const query = queries[index];
+  const queryKey = `slow:${index}`;
+  try {
     try {
       await scanCodeSearch(options, query, queryKey);
     } catch (error) {
       log('query_scan_failed', { queryKey, error: error instanceof Error ? error.message : 'unknown' });
     }
-    await sleep(6_500);
+  } finally {
+    await advanceLaneCursor(options.pool, 'slow', (index + 1) % queries.length);
   }
 }
 
+function uniqueCodeItems(items: CodeSearchItem[]): CodeSearchItem[] {
+  const seen = new Set<string>();
+  const unique: CodeSearchItem[] = [];
+  for (const item of items) {
+    const key = `${item.repository?.full_name ?? ''}:${item.path}:${item.sha ?? item.html_url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+  }
+  return unique;
+}
+
 async function scanCodeSearch(options: PollerOptions, query: string, queryKey: string): Promise<IngestResult> {
-  const cacheKey = `search:code:${queryKey}`;
-  const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, 'code');
-  if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
-  const response = await options.github.request<SearchResponse<CodeSearchItem>>(
-    `/search/code?q=${encodeQuery(query)}&sort=indexed&order=desc&per_page=${config.searchPageSize}`,
-    { cacheKey, accept: 'application/vnd.github.text-match+json' }
-  );
-  const items = response.notModified ? [] : response.data?.items ?? [];
+  const allItems: CodeSearchItem[] = [];
+  let totalCount = 0;
+  let lastResponse: Awaited<ReturnType<GitHubClient['request']>> | undefined;
+
+  for (let page = 1; page <= config.maxCodeSearchPages; page += 1) {
+    const cacheKey = `search:code:${queryKey}`;
+    if (page === 1) {
+      const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, 'code');
+      if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
+    }
+    const response = await options.github.request<SearchResponse<CodeSearchItem>>(
+      `/search/code?q=${encodeQuery(query)}&sort=indexed&order=desc&per_page=${config.searchPageSize}&page=${page}`,
+      page === 1 ? { cacheKey, accept: 'application/vnd.github.text-match+json' } : { accept: 'application/vnd.github.text-match+json' }
+    );
+    lastResponse = response;
+    const pageItems = response.notModified ? [] : response.data?.items ?? [];
+    totalCount = response.data?.total_count ?? totalCount;
+    allItems.push(...pageItems);
+    if (response.notModified || pageItems.length < config.searchPageSize) break;
+    if (totalCount > 0 && uniqueCodeItems(allItems).length >= Math.min(totalCount, 1000)) break;
+  }
+
+  const items = uniqueCodeItems(allItems);
   let newCodes = 0;
   let filesFetched = 0;
   for (const item of items) {
     const repoFullName = item.repository?.full_name ?? 'unknown/unknown';
     let text = item.text_matches?.map((match) => match.fragment ?? '').join('\n') ?? '';
     if (filesFetched < config.maxCodeFilesPerScan && repoFullName !== 'unknown/unknown') {
-      const content = await fetchRepoFile(options.github, repoFullName, item.path).catch(() => undefined);
+      const content = await fetchRepoFile(options.github, repoFullName, item.path, item.sha).catch(() => undefined);
       if (content) {
         text = content;
         filesFetched += 1;
@@ -271,18 +356,19 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
     queryKey,
     surface: 'code',
     mode: 'live',
-    etag: response.etag,
-    hitsFound: response.data?.total_count ?? items.length,
+    etag: lastResponse?.etag,
+    hitsFound: items.length,
     newCodes,
-    ...rateLimitFields(response.rateLimit)
+    ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
-  await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
-  return { hitsFound: items.length, newCodes, rateLimitRemaining: response.rateLimit.remaining, etag: response.etag };
+  if (lastResponse) await options.github.paceIfNeeded(lastResponse.rateLimit, config.liveMinimumRateLimitPercent);
+  return { hitsFound: items.length, newCodes, rateLimitRemaining: lastResponse?.rateLimit.remaining, etag: lastResponse?.etag };
 }
 
-async function fetchRepoFile(github: GitHubClient, repoFullName: string, filePath: string): Promise<string | undefined> {
+async function fetchRepoFile(github: GitHubClient, repoFullName: string, filePath: string, ref?: string): Promise<string | undefined> {
   const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
-  const response = await github.request<{ content?: string; encoding?: string }>(`/repos/${repoFullName}/contents/${encodedPath}`);
+  const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+  const response = await github.request<{ content?: string; encoding?: string }>(`/repos/${repoFullName}/contents/${encodedPath}${refQuery}`);
   if (!response.data?.content || response.data.encoding !== 'base64') return undefined;
   return Buffer.from(response.data.content.replace(/\n/g, ''), 'base64').toString('utf8');
 }
@@ -294,7 +380,7 @@ export async function scanWatchlist(options: PollerOptions): Promise<void> {
     try {
       const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, cacheKey, 'core-commits');
       if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
-      const response = await options.github.request<RepoCommitListItem[]>(`/repos/${entry.repo}/commits?per_page=5`, { cacheKey });
+      const response = await options.github.request<RepoCommitListItem[]>(`/repos/${entry.repo}/commits?per_page=20`, { cacheKey });
       const items = response.notModified ? [] : response.data ?? [];
       let newCodes = 0;
       for (const item of items) {
@@ -347,6 +433,48 @@ function previousWindow(lastWindow: string | undefined, days: number): { start: 
   return { start: isoDate(start), end: isoDate(end) };
 }
 
+function windowDayCount(start: string, end: string): number {
+  const startMs = new Date(`${start}T00:00:00Z`).getTime();
+  const endMs = new Date(`${end}T00:00:00Z`).getTime();
+  return Math.max(1, Math.floor((endMs - startMs) / 86_400_000) + 1);
+}
+
+function shiftIsoDate(value: string, days: number): string {
+  const date = new Date(`${value}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return isoDate(date);
+}
+
+async function scanBackfillQueryRange(
+  options: PollerOptions,
+  baseQuery: string,
+  bundle: number,
+  start: string,
+  end: string
+): Promise<boolean> {
+  const cursorWindow = `${start}..${end}`;
+  const query = addCommitDateWindow(baseQuery, start, end);
+  try {
+    const result = await scanCommitSearch(options, query, `backfill:${bundle}`, 'backfill', cursorWindow);
+    if (result.complete) return true;
+    const days = windowDayCount(start, end);
+    if (days <= 1) {
+      log('backfill_query_incomplete', { cursorWindow, bundle, pagesScanned: result.pagesScanned, hitsFound: result.hitsFound });
+      return false;
+    }
+    const leftDays = Math.floor(days / 2);
+    const mid = shiftIsoDate(start, leftDays - 1);
+    const rightStart = shiftIsoDate(mid, 1);
+    log('backfill_window_split', { cursorWindow, bundle, left: `${start}..${mid}`, right: `${rightStart}..${end}` });
+    const leftComplete = await scanBackfillQueryRange(options, baseQuery, bundle, start, mid);
+    const rightComplete = await scanBackfillQueryRange(options, baseQuery, bundle, rightStart, end);
+    return leftComplete && rightComplete;
+  } catch (error) {
+    log('backfill_query_failed', { cursorWindow, bundle, error: error instanceof Error ? error.message : 'unknown' });
+    return false;
+  }
+}
+
 export async function scanHistoricalBackfill(options: PollerOptions): Promise<void> {
   if (!config.backfillEnabled) return;
   const lastWindow = await latestBackfillWindow(options.pool);
@@ -354,18 +482,13 @@ export async function scanHistoricalBackfill(options: PollerOptions): Promise<vo
   if (new Date(window.end).getTime() < new Date(config.backfillStopDate).getTime()) return;
   const cursorWindow = `${window.start}..${window.end}`;
   const queries = buildSearchQueries(options.vendors);
-  let failedQueries = 0;
+  let incompleteQueries = 0;
   for (let index = 0; index < queries.length; index += 1) {
-    const query = addCommitDateWindow(queries[index], window.start, window.end);
-    try {
-      await scanCommitSearch(options, query, `backfill:${index}`, 'backfill', cursorWindow);
-    } catch (error) {
-      failedQueries += 1;
-      log('backfill_query_failed', { cursorWindow, bundle: index, error: error instanceof Error ? error.message : 'unknown' });
-    }
+    const complete = await scanBackfillQueryRange(options, queries[index], index, window.start, window.end);
+    if (!complete) incompleteQueries += 1;
   }
-  if (failedQueries > 0) {
-    log('backfill_window_incomplete', { cursorWindow, failedQueries });
+  if (incompleteQueries > 0) {
+    log('backfill_window_incomplete', { cursorWindow, incompleteQueries });
     return;
   }
   await insertScanRun(options.pool, {

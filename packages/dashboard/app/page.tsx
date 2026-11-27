@@ -1,7 +1,8 @@
-import { countPromoCodes, latestScanStatus, listFilterValues, queryPromoCodes, type ScanStatus } from '@promo/shared';
+import { countPromoCodes, latestScanStatus, listFilterValues, queryPromoCodes, sanitizeRedeemUrl } from '@promo/shared';
 import { CopyButton } from '@/components/CopyButton';
 import { StatusToggle } from '@/components/StatusToggle';
 import { getPool } from '@/lib/db';
+import { clampPage, parseDashboardParams, totalPagesFor } from '@/lib/promoQuery';
 
 export const dynamic = 'force-dynamic';
 
@@ -31,10 +32,6 @@ function formatIstDate(value: string | Date): string {
   });
 }
 
-function firstParam(value: string | string[] | undefined): string {
-  return Array.isArray(value) ? value[0] ?? '' : value ?? '';
-}
-
 function badgeClass(value: string): string {
   if (value === 'high' || value === 'active') return 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30';
   if (value === 'medium' || value === 'unverified') return 'bg-amber-500/15 text-amber-300 ring-amber-500/30';
@@ -60,7 +57,7 @@ function Select({ name, value, values, label }: { name: string; value: string; v
   );
 }
 
-function pageHref(filters: Record<string, string>, page: number): string {
+function pageHref(filters: object, page: number): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (value) params.set(key, value);
@@ -71,26 +68,17 @@ function pageHref(filters: Record<string, string>, page: number): string {
 }
 
 export default async function DashboardPage({ searchParams }: { searchParams: Record<string, string | string[] | undefined> }) {
-  const filters = {
-    q: firstParam(searchParams.q),
-    vendor: firstParam(searchParams.vendor),
-    category: firstParam(searchParams.category),
-    sourceType: firstParam(searchParams.sourceType),
-    confidence: firstParam(searchParams.confidence),
-    status: firstParam(searchParams.status),
-    sort: firstParam(searchParams.sort)
-  };
-  const page = Math.max(1, Number.parseInt(firstParam(searchParams.page), 10) || 1);
-  const offset = (page - 1) * PAGE_SIZE;
+  const { filters, requestedPage } = parseDashboardParams(searchParams);
   const pool = getPool();
-  const [rows, total, filterValues, worker] = await Promise.all([
-    queryPromoCodes(pool, { ...filters, limit: PAGE_SIZE, offset }).catch(() => []),
-    countPromoCodes(pool, filters).catch(() => 0),
-    listFilterValues(pool).catch(() => ({ vendors: [], categories: [] })),
-    latestScanStatus(pool).catch((): ScanStatus => ({ ranAt: null, rateLimitRemaining: null, recentRuns: 0, rateLimits: {} }))
+  const total = await countPromoCodes(pool, filters);
+  const totalPages = totalPagesFor(total, PAGE_SIZE);
+  const currentPage = clampPage(requestedPage, totalPages);
+  const offset = (currentPage - 1) * PAGE_SIZE;
+  const [rows, filterValues, worker] = await Promise.all([
+    queryPromoCodes(pool, { ...filters, limit: PAGE_SIZE, offset }),
+    listFilterValues(pool),
+    latestScanStatus(pool)
   ]);
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages);
   const rangeStart = total === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
   const rangeEnd = Math.min(total, (currentPage - 1) * PAGE_SIZE + rows.length);
   const core = worker.rateLimits?.core;
@@ -163,7 +151,9 @@ export default async function DashboardPage({ searchParams }: { searchParams: Re
           </div>
         </div>
         <div className="divide-y divide-slate-800">
-          {rows.map((row) => (
+          {rows.map((row) => {
+            const redeemUrl = sanitizeRedeemUrl(row.redeem_url);
+            return (
             <article key={row.id} className="grid gap-4 p-4 lg:grid-cols-[1fr_13rem]">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
@@ -184,7 +174,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Re
                 </div>
                 <div className="mt-3 flex flex-wrap gap-3 text-sm">
                   <a className="text-sky-300 hover:text-sky-200" href={row.source_url} target="_blank" rel="noreferrer">GitHub source</a>
-                  {row.redeem_url ? <a className="text-emerald-300 hover:text-emerald-200" href={row.redeem_url} target="_blank" rel="noreferrer">Redeem</a> : null}
+                  {redeemUrl ? <a className="text-emerald-300 hover:text-emerald-200" href={redeemUrl} target="_blank" rel="noreferrer">Redeem</a> : null}
                 </div>
               </div>
               <div className="flex flex-col items-stretch gap-3 lg:items-end">
@@ -192,7 +182,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: Re
                 <StatusToggle id={row.id} currentStatus={row.status} />
               </div>
             </article>
-          ))}
+            );
+          })}
           {!rows.length ? (
             <div className="p-8 text-center text-slate-400">No matching promo codes yet. Once the worker records scan results, they will appear here.</div>
           ) : null}

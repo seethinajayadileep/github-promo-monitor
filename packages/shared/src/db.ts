@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { canonicalCode } from './dedupe.js';
 import { inferRateLimitResource } from './github.js';
+import { sanitizeRedeemUrl } from './urls.js';
 import type { PromoCandidate, PromoCodeRow, PromoStatus, RateLimitBucket, ScanRunInsert } from './types.js';
 
 export const BACKFILL_WINDOW_COMPLETE_KEY = 'backfill-window-complete';
@@ -27,6 +28,7 @@ export async function upsertPromoCandidate(pool: pg.Pool, candidate: PromoCandid
     await client.query('BEGIN');
     const vendor = candidate.vendor.trim();
     const code = canonicalCode(candidate.code);
+    const redeemUrl = sanitizeRedeemUrl(candidate.redeemUrl) ?? null;
     const inserted = await client.query<{ id: number; inserted: boolean }>(
       `INSERT INTO promo_codes (
          vendor, code, category, offer_summary, redeem_url, source_url, source_type, repo_full_name,
@@ -34,7 +36,14 @@ export async function upsertPromoCandidate(pool: pg.Pool, candidate: PromoCandid
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'unverified',$11)
        ON CONFLICT ((lower(vendor)), (upper(code))) DO UPDATE
        SET last_seen_at = now(),
-           offer_summary = CASE WHEN length(EXCLUDED.offer_summary) > length(promo_codes.offer_summary) THEN EXCLUDED.offer_summary ELSE promo_codes.offer_summary END,
+           offer_summary = CASE
+             WHEN length(EXCLUDED.offer_summary) = 0 THEN promo_codes.offer_summary
+             WHEN EXCLUDED.offer_summary NOT LIKE '%<%'
+               AND EXCLUDED.offer_summary NOT LIKE '%**%'
+               AND POSITION(chr(96) IN EXCLUDED.offer_summary) = 0 THEN EXCLUDED.offer_summary
+             WHEN length(EXCLUDED.offer_summary) > length(promo_codes.offer_summary) THEN EXCLUDED.offer_summary
+             ELSE promo_codes.offer_summary
+           END,
            redeem_url = COALESCE(promo_codes.redeem_url, EXCLUDED.redeem_url),
            expires_at = COALESCE(promo_codes.expires_at, EXCLUDED.expires_at),
            confidence = CASE
@@ -54,7 +63,7 @@ export async function upsertPromoCandidate(pool: pg.Pool, candidate: PromoCandid
         code,
         candidate.category,
         candidate.offerSummary,
-        candidate.redeemUrl ?? null,
+        redeemUrl,
         candidate.sourceUrl,
         candidate.sourceType,
         candidate.repoFullName,
@@ -84,6 +93,31 @@ export async function upsertPromoCandidate(pool: pg.Pool, candidate: PromoCandid
   } finally {
     client.release();
   }
+}
+
+export async function pruneScanRuns(pool: pg.Pool, retentionDays = 7): Promise<number> {
+  const result = await pool.query(
+    "DELETE FROM scan_runs WHERE ran_at < now() - ($1::int * interval '1 day') AND query_key <> $2",
+    [Math.max(1, Math.floor(retentionDays)), BACKFILL_WINDOW_COMPLETE_KEY]
+  );
+  return result.rowCount ?? 0;
+}
+
+export async function getLaneCursor(pool: pg.Pool, lane: string): Promise<number> {
+  const result = await pool.query<{ next_index: number }>(
+    'SELECT next_index FROM scan_lane_cursors WHERE lane = $1',
+    [lane]
+  );
+  return Math.max(0, Number(result.rows[0]?.next_index ?? 0));
+}
+
+export async function advanceLaneCursor(pool: pg.Pool, lane: string, nextIndex: number): Promise<void> {
+  await pool.query(
+    `INSERT INTO scan_lane_cursors (lane, next_index, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (lane) DO UPDATE SET next_index = EXCLUDED.next_index, updated_at = now()`,
+    [lane, Math.max(0, Math.floor(nextIndex))]
+  );
 }
 
 export async function insertScanRun(pool: pg.Pool, run: ScanRunInsert): Promise<void> {

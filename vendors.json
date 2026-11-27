@@ -473,5 +473,99 @@
     "keywords": [
       "JetBrains"
     ]
+  },
+  {
+    "id": "leanmcp",
+    "name": "LeanMCP",
+    "category": "developer-tools",
+    "domains": [
+      "leanmcp.com"
+    ],
+    "keywords": [
+      "LeanMCP"
+    ]
+  },
+  {
+    "id": "sidrune",
+    "name": "Sidrune AI",
+    "category": "ai",
+    "domains": [
+      "sidrune.ai"
+    ],
+    "keywords": [
+      "Sidrune AI",
+      "Sidrune"
+    ]
+  },
+  {
+    "id": "nebius",
+    "name": "Nebius",
+    "category": "cloud",
+    "domains": [
+      "nebius.com"
+    ],
+    "keywords": [
+      "Nebius",
+      "Nebius AI Cloud"
+    ]
+  },
+  {
+    "id": "baseten",
+    "name": "Baseten",
+    "category": "ai",
+    "domains": [
+      "baseten.co"
+    ],
+    "keywords": [
+      "Baseten"
+    ]
+  },
+  {
+    "id": "ibm",
+    "name": "IBM",
+    "category": "cloud",
+    "domains": [
+      "ibm.com",
+      "cloud.ibm.com"
+    ],
+    "keywords": [
+      "IBM",
+      "IBM Cloud"
+    ]
+  },
+  {
+    "id": "vultr",
+    "name": "Vultr",
+    "category": "cloud",
+    "domains": [
+      "vultr.com"
+    ],
+    "keywords": [
+      "Vultr"
+    ]
+  },
+  {
+    "id": "confluent",
+    "name": "Confluent",
+    "category": "developer-tools",
+    "domains": [
+      "confluent.io",
+      "confluent.cloud"
+    ],
+    "keywords": [
+      "Confluent",
+      "Confluent Cloud"
+    ]
+  },
+  {
+    "id": "udemy",
+    "name": "Udemy",
+    "category": "education",
+    "domains": [
+      "udemy.com"
+    ],
+    "keywords": [
+      "Udemy"
+    ]
   }
 ]
