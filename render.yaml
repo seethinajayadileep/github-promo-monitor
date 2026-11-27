@@ -2,7 +2,7 @@ databases:
   - name: promo-db
     databaseName: promo_monitor
     user: promo_monitor
-    plan: free
+    plan: basic-256mb
 
 services:
   - type: worker
