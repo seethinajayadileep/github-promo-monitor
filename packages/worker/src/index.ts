@@ -1,6 +1,20 @@
-import { GitHubClient, applyDailyExpiry, configuredLlmProvider, createPool, pruneScanRuns } from '@promo/shared';
+import {
+  GitHubClient,
+  applyDailyExpiry,
+  buildCodeSearchQueries,
+  buildSearchQueries,
+  configuredLlmModel,
+  configuredLlmProvider,
+  createPool,
+  insertGithubRateEvent,
+  pruneScanRuns,
+  publicExaSettings,
+  sanitizePublicWorkerConfig,
+  upsertWorkerRuntime
+} from '@promo/shared';
 import { config, loadVendors, loadWatchlist } from './config.js';
-import { scanFastLane, scanHistoricalBackfill, scanSlowLane, scanWatchlist, type PollerOptions } from './poller.js';
+import { scanExaLane } from './exaLane.js';
+import { STATIC_WATCHLIST_COMMIT_PAGE_SIZE, scanFastLane, scanHistoricalBackfill, scanSlowLane, scanWatchlist, type PollerOptions } from './poller.js';
 
 function log(event: string, details: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ event, at: new Date().toISOString(), ...details }));
@@ -34,8 +48,62 @@ async function main(): Promise<void> {
   const pool = createPool();
   const vendors = loadVendors();
   const watchlist = loadWatchlist();
-  const github = new GitHubClient();
+  const github = new GitHubClient(process.env, {
+    onRateLimit: (event) => {
+      void insertGithubRateEvent(pool, event).catch((error) => {
+        log('rate_event_persist_failed', { error: error instanceof Error ? error.message : 'unknown' });
+      });
+    }
+  });
   const options: PollerOptions = { pool, github, vendors, watchlist };
+  const exa = publicExaSettings();
+
+  const reportRuntime = async () => {
+    await upsertWorkerRuntime(pool, {
+      llmProvider: configuredLlmProvider(),
+      llmModel: configuredLlmModel(),
+      config: sanitizePublicWorkerConfig({
+        fastLaneIntervalMs: config.fastLaneIntervalMs,
+        slowLaneIntervalMs: config.slowLaneIntervalMs,
+        watchlistIntervalMs: config.watchlistIntervalMs,
+        backfillIntervalMs: config.backfillIntervalMs,
+        searchPageSize: config.searchPageSize,
+        backfillEnabled: config.backfillEnabled,
+        backfillDaysPerWindow: config.backfillDaysPerWindow,
+        backfillMinimumRateLimitPercent: config.minimumRateLimitPercent,
+        liveMinimumRateLimitPercent: config.liveMinimumRateLimitPercent,
+        backfillStopDate: config.backfillStopDate,
+        backfillStartDate: process.env.BACKFILL_START_DATE || null,
+        maxCommitDetailsPerScan: config.maxCommitDetailsPerScan,
+        maxCodeFilesPerScan: config.maxCodeFilesPerScan,
+        maxCommitSearchPages: config.maxCommitSearchPages,
+        maxIssueSearchPages: config.maxIssueSearchPages,
+        maxCodeSearchPages: config.maxCodeSearchPages,
+        liveCommitWindowDays: config.liveCommitWindowDays,
+        maxFollowedReposPerScan: config.maxFollowedReposPerScan,
+        followedRepoCommitPageSize: config.followedRepoCommitPageSize,
+        maxFollowedCommitDetailsPerRepo: config.maxFollowedCommitDetailsPerRepo,
+        maxFollowedCommitDetailsPerScan: config.maxFollowedCommitDetailsPerScan,
+        scanRunRetentionDays: config.scanRunRetentionDays,
+        searchQueryCount: buildSearchQueries(vendors).length,
+        codeQueryCount: buildCodeSearchQueries(vendors).length,
+        vendorCount: vendors.length,
+        watchlistCount: watchlist.length,
+        githubTokenCount: github.tokenPool.size,
+        staticWatchlistCommitPageSize: STATIC_WATCHLIST_COMMIT_PAGE_SIZE,
+        llmProvider: configuredLlmProvider(),
+        llmModel: configuredLlmModel(),
+        exaConfigured: exa.configured,
+        exaSearchType: exa.type,
+        exaIntervalMs: exa.intervalMs,
+        exaNumResults: exa.numResults,
+        exaMaxAgeHours: exa.maxAgeHours,
+        exaPublishedWithinDays: exa.publishedWithinDays,
+        exaQueryCount: vendors.length,
+        exaTimeoutMs: exa.timeoutMs
+      })
+    });
+  };
 
   if (!github.tokenPool.size) {
     log('github_token_missing', { detail: 'running unauthenticated; low GitHub limits apply' });
@@ -51,12 +119,26 @@ async function main(): Promise<void> {
     maxCommitSearchPages: config.maxCommitSearchPages,
     maxIssueSearchPages: config.maxIssueSearchPages,
     maxCodeSearchPages: config.maxCodeSearchPages,
-    liveCommitWindowDays: config.liveCommitWindowDays
+    liveCommitWindowDays: config.liveCommitWindowDays,
+    exaConfigured: exa.configured,
+    exaSearchType: exa.type,
+    exaIntervalMs: exa.intervalMs
   });
+
+  try {
+    await reportRuntime();
+  } catch (error) {
+    log('worker_runtime_persist_failed', { error: error instanceof Error ? error.message : 'unknown' });
+  }
 
   const dailyExpiry = async () => {
     const result = await applyDailyExpiry(pool);
     const prunedScanRuns = await pruneScanRuns(pool, config.scanRunRetentionDays);
+    try {
+      await reportRuntime();
+    } catch (error) {
+      log('worker_runtime_persist_failed', { error: error instanceof Error ? error.message : 'unknown' });
+    }
     log('daily_expiry_complete', { ...result, prunedScanRuns });
   };
   await runSafely('daily-expiry', dailyExpiry);
@@ -68,7 +150,12 @@ async function main(): Promise<void> {
     laneLoop('daily-expiry', 24 * 60 * 60 * 1000, dailyExpiry, 60_000)
   ];
   if (config.backfillEnabled) {
-    lanes.push(laneLoop('historical-backfill', 30 * 60 * 1000, () => scanHistoricalBackfill(options), 60_000));
+    lanes.push(laneLoop('historical-backfill', config.backfillIntervalMs, () => scanHistoricalBackfill(options), 60_000));
+  }
+  if (exa.configured) {
+    lanes.push(laneLoop('exa', exa.intervalMs, () => scanExaLane(options), 60_000));
+  } else {
+    log('exa_lane_skipped', { reason: 'not-configured' });
   }
   await Promise.all(lanes);
 }

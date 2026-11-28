@@ -7,22 +7,33 @@ import {
   advanceLaneCursor,
   buildCodeSearchQueries,
   buildSearchQueries,
+  classifyLlmFailure,
+  configuredLlmModel,
+  configuredLlmProvider,
   dedupeCandidates,
   encodeQuery,
   enrichAndGateCandidates,
   extractPassOne,
   getLaneCursor,
+  insertLlmCall,
+  insertLlmGateEvent,
   insertScanRun,
   isFollowableRepo,
+  isRateLimitErrorMessage,
+  laneFromQueryKey,
   latestBackfillWindow,
   latestEtag,
   listFollowedRepos,
   markFollowedRepoPolled,
   notifyAll,
+  previousBackfillWindow,
   rememberFollowedRepo,
+  searchPageCapSaturated,
+  singlePageWasFull,
   syncFollowedRepos,
   upsertPromoCandidate,
   type GitHubResponse,
+  type LlmUsageRecord,
   type PromoCandidate,
   type RateLimitState,
   type ScanMode,
@@ -53,6 +64,20 @@ interface IngestResult {
   newCodes: number;
   rateLimitRemaining?: number;
   etag?: string;
+}
+
+export interface IngestCounts {
+  newCodes: number;
+  pass1Candidates: number;
+  pass1Hits: number;
+  gateAccepted: number;
+  gateRejected: number;
+  gateFailed: number;
+  gateBypassed: number;
+}
+
+function emptyIngest(): IngestCounts {
+  return { newCodes: 0, pass1Candidates: 0, pass1Hits: 0, gateAccepted: 0, gateRejected: 0, gateFailed: 0, gateBypassed: 0 };
 }
 
 function log(event: string, details: Record<string, unknown> = {}): void {
@@ -92,10 +117,60 @@ async function ingestText(
   },
   mode: ScanMode
 ): Promise<number> {
+  return (await ingestObservedText(pool, vendors, input, mode)).newCodes;
+}
+
+export async function ingestObservedText(
+  pool: pg.Pool,
+  vendors: VendorConfig[],
+  input: {
+    text: string;
+    sourceUrl: string;
+    sourceType: SourceType;
+    repoFullName: string;
+    sourceDate?: Date;
+    path?: string;
+  },
+  mode: ScanMode
+): Promise<IngestCounts> {
   const passOne = extractPassOne({ ...input, vendors });
-  if (!passOne.candidates.length) return 0;
-  const candidates = dedupeCandidates(await enrichAndGateCandidates(passOne.candidates, vendors, log));
-  let newCodes = 0;
+  if (!passOne.candidates.length) return emptyIngest();
+  const counts = emptyIngest();
+  counts.pass1Candidates = passOne.candidates.length;
+  counts.pass1Hits = 1;
+  const provider = configuredLlmProvider();
+  if (provider === 'none') counts.gateBypassed = passOne.candidates.length;
+  const candidates = dedupeCandidates(await enrichAndGateCandidates(passOne.candidates, vendors, (event, details) => {
+    log(event, details);
+    if (event === 'llm_gate_accepted') counts.gateAccepted += 1;
+    else if (event === 'llm_gate_rejected') counts.gateRejected += 1;
+    else if (event === 'llm_gate_failed') counts.gateFailed += 1;
+    const decision = event === 'llm_gate_accepted'
+      ? 'accepted'
+      : event === 'llm_gate_rejected'
+        ? 'rejected'
+        : event === 'llm_gate_failed'
+          ? 'failed'
+          : null;
+    if (!decision) return;
+    const reason = decision === 'accepted'
+      ? null
+      : decision === 'rejected'
+        ? (details.reason === 'invalid-code-or-vendor' ? 'invalid-code-or-vendor' : 'not-public-promo')
+        : classifyLlmFailure(typeof details.reason === 'string' ? details.reason : undefined).code;
+    void insertLlmGateEvent(pool, {
+      provider,
+      model: configuredLlmModel(),
+      decision,
+      reason
+    }).catch((error) => {
+      log('llm_gate_persist_failed', { error: error instanceof Error ? error.message : 'unknown' });
+    });
+  }, {
+    onCall: (record: LlmUsageRecord) => insertLlmCall(pool, record).catch((error) => {
+      log('llm_usage_persist_failed', { error: error instanceof Error ? error.message : 'unknown' });
+    })
+  }));
   for (const candidate of candidates) {
     const result = await upsertPromoCandidate(pool, candidate);
     if (isFollowableRepo(candidate.repoFullName)) {
@@ -109,7 +184,7 @@ async function ingestText(
       }
     }
     if (!result.isNew) continue;
-    newCodes += 1;
+    counts.newCodes += 1;
     const alertable = mode === 'live' && (candidate.confidence === 'high' || candidate.confidence === 'medium');
     if (alertable) {
       const results = await notifyAll(candidate);
@@ -117,7 +192,7 @@ async function ingestText(
       if (failures.length) log('alert_delivery_failed', { channels: failures.map((item) => item.channel), vendor: candidate.vendor, code: candidate.code });
     }
   }
-  return newCodes;
+  return counts;
 }
 
 async function commitDetailText(github: GitHubClient, repoFullName: string, sha: string): Promise<{ text: string; detail?: CommitDetail }> {
@@ -204,13 +279,14 @@ async function fetchSearchPage<T>(
   path: string,
   requestOptions: { cacheKey?: string; accept?: string },
   context: Record<string, unknown>
-): Promise<{ ok: true; response: GitHubResponse<SearchResponse<T>> } | { ok: false }> {
+): Promise<{ ok: true; response: GitHubResponse<SearchResponse<T>> } | { ok: false; error: string }> {
   try {
     const response = await github.request<SearchResponse<T>>(path, requestOptions);
     return { ok: true, response };
   } catch (error) {
-    log('search_page_failed', { ...context, error: error instanceof Error ? error.message : 'unknown' });
-    return { ok: false };
+    const message = error instanceof Error ? error.message : 'unknown';
+    log('search_page_failed', { ...context, error: message });
+    return { ok: false, error: message };
   }
 }
 
@@ -225,6 +301,10 @@ async function scanCommitSearch(
   let pagesScanned = 0;
   let totalCount = 0;
   let complete = true;
+  let lastPageFull = false;
+  let pageFailed = false;
+  let rateLimited = false;
+  let reportedIncomplete = false;
   let lastResponse: GitHubResponse<SearchResponse<CommitSearchItem>> | undefined;
   const minimumRateLimitPercent = mode === 'backfill' ? config.minimumRateLimitPercent : config.liveMinimumRateLimitPercent;
 
@@ -243,6 +323,8 @@ async function scanCommitSearch(
     );
     if (!fetched.ok) {
       complete = false;
+      pageFailed = true;
+      rateLimited = isRateLimitErrorMessage(fetched.error);
       break;
     }
     const response = fetched.response;
@@ -250,8 +332,10 @@ async function scanCommitSearch(
     pagesScanned += 1;
     const items = response.notModified ? [] : response.data?.items ?? [];
     totalCount = response.data?.total_count ?? totalCount;
+    reportedIncomplete = reportedIncomplete || Boolean(response.data?.incomplete_results);
     allItems.push(...items);
-    if (response.notModified || items.length < config.searchPageSize) break;
+    lastPageFull = items.length >= config.searchPageSize;
+    if (response.notModified || !lastPageFull) break;
     const scannedCount = uniqueCommitItems(allItems).length;
     if (totalCount > 0 && scannedCount >= Math.min(totalCount, 1000)) break;
     if (page === config.maxCommitSearchPages) {
@@ -271,6 +355,19 @@ async function scanCommitSearch(
     etag: lastResponse?.etag,
     hitsFound: items.length,
     newCodes,
+    pagesScanned,
+    reportedTotal: totalCount,
+    capSaturated: searchPageCapSaturated({
+      pagesScanned,
+      maxPages: config.maxCommitSearchPages,
+      hitsFetched: items.length,
+      reportedTotal: totalCount,
+      stoppedOnShortPage: !lastPageFull,
+      pageFailed
+    }),
+    rateLimited,
+    reportedIncomplete,
+    lane: laneFromQueryKey(queryKey),
     ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
   if (lastResponse) {
@@ -303,6 +400,12 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
   if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
   const issueQuery = addIssueQualifier(query, 'issue');
   const allItems: IssueSearchItem[] = [];
+  let pagesScanned = 0;
+  let totalCount = 0;
+  let lastPageFull = false;
+  let pageFailed = false;
+  let rateLimited = false;
+  let reportedIncomplete = false;
   let lastResponse: GitHubResponse<SearchResponse<IssueSearchItem>> | undefined;
 
   for (let page = 1; page <= config.maxIssueSearchPages; page += 1) {
@@ -312,13 +415,21 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
       page === 1 ? { cacheKey } : {},
       { queryKey, surface: 'issues', page }
     );
-    if (!fetched.ok) break;
+    if (!fetched.ok) {
+      pageFailed = true;
+      rateLimited = isRateLimitErrorMessage(fetched.error);
+      break;
+    }
     const response = fetched.response;
     lastResponse = response;
+    pagesScanned += 1;
     const pageItems = response.notModified ? [] : response.data?.items ?? [];
+    totalCount = response.data?.total_count ?? totalCount;
+    reportedIncomplete = reportedIncomplete || Boolean(response.data?.incomplete_results);
     allItems.push(...pageItems);
-    if (response.notModified || pageItems.length < config.searchPageSize) break;
-    if (uniqueIssueItems(allItems).length >= Math.min(response.data?.total_count ?? 1000, 1000)) break;
+    lastPageFull = pageItems.length >= config.searchPageSize;
+    if (response.notModified || !lastPageFull) break;
+    if (uniqueIssueItems(allItems).length >= Math.min(totalCount || 1000, 1000)) break;
     if (page < config.maxIssueSearchPages) {
       await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
     }
@@ -342,6 +453,19 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
     etag: lastResponse?.etag,
     hitsFound: items.length,
     newCodes,
+    pagesScanned,
+    reportedTotal: totalCount,
+    capSaturated: searchPageCapSaturated({
+      pagesScanned,
+      maxPages: config.maxIssueSearchPages,
+      hitsFetched: items.length,
+      reportedTotal: totalCount,
+      stoppedOnShortPage: !lastPageFull,
+      pageFailed
+    }),
+    rateLimited,
+    reportedIncomplete,
+    lane: laneFromQueryKey(queryKey),
     ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
   if (lastResponse) await options.github.paceIfNeeded(lastResponse.rateLimit, config.liveMinimumRateLimitPercent);
@@ -380,7 +504,12 @@ function uniqueCodeItems(items: CodeSearchItem[]): CodeSearchItem[] {
 
 async function scanCodeSearch(options: PollerOptions, query: string, queryKey: string): Promise<IngestResult> {
   const allItems: CodeSearchItem[] = [];
+  let pagesScanned = 0;
   let totalCount = 0;
+  let lastPageFull = false;
+  let pageFailed = false;
+  let rateLimited = false;
+  let reportedIncomplete = false;
   let lastResponse: GitHubResponse<SearchResponse<CodeSearchItem>> | undefined;
 
   for (let page = 1; page <= config.maxCodeSearchPages; page += 1) {
@@ -395,13 +524,20 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
       page === 1 ? { cacheKey, accept: 'application/vnd.github.text-match+json' } : { accept: 'application/vnd.github.text-match+json' },
       { queryKey, surface: 'code', page }
     );
-    if (!fetched.ok) break;
+    if (!fetched.ok) {
+      pageFailed = true;
+      rateLimited = isRateLimitErrorMessage(fetched.error);
+      break;
+    }
     const response = fetched.response;
     lastResponse = response;
+    pagesScanned += 1;
     const pageItems = response.notModified ? [] : response.data?.items ?? [];
     totalCount = response.data?.total_count ?? totalCount;
+    reportedIncomplete = reportedIncomplete || Boolean(response.data?.incomplete_results);
     allItems.push(...pageItems);
-    if (response.notModified || pageItems.length < config.searchPageSize) break;
+    lastPageFull = pageItems.length >= config.searchPageSize;
+    if (response.notModified || !lastPageFull) break;
     if (totalCount > 0 && uniqueCodeItems(allItems).length >= Math.min(totalCount, 1000)) break;
     if (page < config.maxCodeSearchPages) {
       await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
@@ -436,6 +572,19 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
     etag: lastResponse?.etag,
     hitsFound: items.length,
     newCodes,
+    pagesScanned,
+    reportedTotal: totalCount,
+    capSaturated: searchPageCapSaturated({
+      pagesScanned,
+      maxPages: config.maxCodeSearchPages,
+      hitsFetched: items.length,
+      reportedTotal: totalCount,
+      stoppedOnShortPage: !lastPageFull,
+      pageFailed
+    }),
+    rateLimited,
+    reportedIncomplete,
+    lane: laneFromQueryKey(queryKey),
     ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
   if (lastResponse) await options.github.paceIfNeeded(lastResponse.rateLimit, config.liveMinimumRateLimitPercent);
@@ -450,7 +599,7 @@ async function fetchRepoFile(github: GitHubClient, repoFullName: string, filePat
   return Buffer.from(response.data.content.replace(/\n/g, ''), 'base64').toString('utf8');
 }
 
-const STATIC_WATCHLIST_COMMIT_PAGE_SIZE = 20;
+export const STATIC_WATCHLIST_COMMIT_PAGE_SIZE = 20;
 
 interface RepoCommitPoll {
   repo: string;
@@ -501,6 +650,10 @@ async function pollRepoCommits(options: PollerOptions, poll: RepoCommitPoll): Pr
     etag: response.etag,
     hitsFound: items.length,
     newCodes,
+    pagesScanned: 1,
+    capSaturated: singlePageWasFull(items.length, poll.perPage),
+    rateLimited: false,
+    lane: poll.lane === 'followed' ? 'followed' : 'watchlist',
     ...rateLimitFields(response.rateLimit)
   });
   await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
@@ -566,17 +719,7 @@ function isoDate(date: Date): string {
 }
 
 function previousWindow(lastWindow: string | undefined, days: number): { start: string; end: string } {
-  const end = new Date();
-  if (process.env.BACKFILL_START_DATE && !lastWindow) {
-    end.setTime(new Date(process.env.BACKFILL_START_DATE).getTime());
-  } else if (lastWindow) {
-    const lastStart = lastWindow.split('..')[0];
-    end.setTime(new Date(lastStart).getTime());
-    end.setUTCDate(end.getUTCDate() - 1);
-  }
-  const start = new Date(end);
-  start.setUTCDate(start.getUTCDate() - days + 1);
-  return { start: isoDate(start), end: isoDate(end) };
+  return previousBackfillWindow(lastWindow, days, new Date(), process.env.BACKFILL_START_DATE || undefined);
 }
 
 function windowDayCount(start: string, end: string): number {

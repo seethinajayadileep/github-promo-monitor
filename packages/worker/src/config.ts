@@ -45,5 +45,7 @@ export const config = {
   followedRepoCommitPageSize: numberEnv('FOLLOWED_REPO_COMMIT_PAGE_SIZE', 30),
   maxFollowedCommitDetailsPerRepo: numberEnv('MAX_FOLLOWED_COMMIT_DETAILS_PER_REPO', 15),
   maxFollowedCommitDetailsPerScan: numberEnv('MAX_FOLLOWED_COMMIT_DETAILS_PER_SCAN', 60),
-  scanRunRetentionDays: numberEnv('SCAN_RUN_RETENTION_DAYS', 7)
+  scanRunRetentionDays: numberEnv('SCAN_RUN_RETENTION_DAYS', 7),
+  backfillIntervalMs: numberEnv('BACKFILL_INTERVAL_MS', 30 * 60 * 1000),
+  exaIntervalMs: numberEnv('EXA_INTERVAL_MS', 30 * 60 * 1000)
 };

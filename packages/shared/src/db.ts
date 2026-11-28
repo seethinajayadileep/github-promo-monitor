@@ -1,6 +1,8 @@
 import pg from 'pg';
 import { canonicalCode } from './dedupe.js';
 import { inferRateLimitResource } from './github.js';
+import { estimateLlmCostUsd, type LlmUsageRecord } from './llmUsage.js';
+import { laneFromQueryKey } from './scanMeta.js';
 import { sanitizeRedeemUrl } from './urls.js';
 import type { PromoCandidate, PromoCodeRow, PromoStatus, RateLimitBucket, ScanRunInsert } from './types.js';
 
@@ -96,10 +98,20 @@ export async function upsertPromoCandidate(pool: pg.Pool, candidate: PromoCandid
 }
 
 export async function pruneScanRuns(pool: pg.Pool, retentionDays = 7): Promise<number> {
+  const days = Math.max(1, Math.floor(retentionDays));
   const result = await pool.query(
     "DELETE FROM scan_runs WHERE ran_at < now() - ($1::int * interval '1 day') AND query_key <> $2",
-    [Math.max(1, Math.floor(retentionDays)), BACKFILL_WINDOW_COMPLETE_KEY]
+    [days, BACKFILL_WINDOW_COMPLETE_KEY]
   );
+  try {
+    await pool.query(
+      "DELETE FROM github_rate_events WHERE occurred_at < now() - ($1::int * interval '1 day')",
+      [days]
+    );
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : '';
+    if (code !== '42P01') throw error;
+  }
   return result.rowCount ?? 0;
 }
 
@@ -170,13 +182,19 @@ export async function advanceLaneCursor(pool: pg.Pool, lane: string, nextIndex: 
   );
 }
 
+function nonNegativeInt(value: number | undefined): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.floor(value));
+}
+
 export async function insertScanRun(pool: pg.Pool, run: ScanRunInsert): Promise<void> {
   await pool.query(
     `INSERT INTO scan_runs (
        query_key, surface, mode, cursor_window, etag, hits_found, new_codes,
-       rate_limit_remaining, rate_limit_limit, rate_limit_resource
+       rate_limit_remaining, rate_limit_limit, rate_limit_resource,
+       pages_scanned, reported_total, cap_saturated, rate_limited, reported_incomplete, lane
      )
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [
       run.queryKey,
       run.surface,
@@ -187,8 +205,144 @@ export async function insertScanRun(pool: pg.Pool, run: ScanRunInsert): Promise<
       run.newCodes,
       run.rateLimitRemaining ?? null,
       run.rateLimitLimit ?? null,
-      run.rateLimitResource ?? inferRateLimitResource(run.surface)
+      run.rateLimitResource ?? inferRateLimitResource(run.surface),
+      nonNegativeInt(run.pagesScanned),
+      nonNegativeInt(run.reportedTotal),
+      run.capSaturated ?? null,
+      run.rateLimited ?? null,
+      run.reportedIncomplete ?? null,
+      run.lane ?? laneFromQueryKey(run.queryKey)
     ]
+  );
+}
+
+export async function insertLlmCall(pool: pg.Pool, record: LlmUsageRecord): Promise<void> {
+  const status = record.status === 'success' || record.status === 'timeout' || record.status === 'error' ? record.status : 'error';
+  const cost = estimateLlmCostUsd(record.model, record);
+  await pool.query(
+    `INSERT INTO llm_calls (
+       provider, model, status, finish_reason, failure_code,
+       prompt_tokens, completion_tokens, cached_tokens, cost_usd, cost_estimated, attempt
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [
+      record.provider,
+      record.model.slice(0, 80),
+      status,
+      record.finishReason ? record.finishReason.slice(0, 40) : null,
+      record.failureCode ? record.failureCode.slice(0, 80) : null,
+      Math.max(0, Math.floor(record.promptTokens)),
+      Math.max(0, Math.floor(record.completionTokens)),
+      Math.max(0, Math.floor(record.cachedTokens)),
+      cost.usd,
+      cost.priced,
+      Math.max(1, Math.floor(record.attempt))
+    ]
+  );
+}
+
+export async function insertLlmGateEvent(
+  pool: pg.Pool,
+  event: { provider: string; model: string; decision: 'accepted' | 'rejected' | 'failed'; reason?: string | null }
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO llm_gate_events (provider, model, decision, reason)
+     VALUES ($1,$2,$3,$4)`,
+    [
+      event.provider.slice(0, 40),
+      event.model.slice(0, 80),
+      event.decision,
+      event.reason ? event.reason.slice(0, 80) : null
+    ]
+  );
+}
+
+export async function insertGithubRateEvent(
+  pool: pg.Pool,
+  event: { kind: 'primary' | 'secondary'; status?: number; resource?: string }
+): Promise<void> {
+  if (event.kind !== 'primary' && event.kind !== 'secondary') return;
+  const resource = event.resource ? event.resource.slice(0, 40) : null;
+  await pool.query(
+    `INSERT INTO github_rate_events (kind, status, resource) VALUES ($1,$2,$3)`,
+    [event.kind, event.status ?? null, resource]
+  );
+}
+
+export interface ExaSearchInsert {
+  queryKey: string;
+  vendor: string;
+  status: 'ok' | 'error';
+  errorCode?: string | null;
+  searchType: string;
+  numResultsRequested: number;
+  maxAgeHours?: number | null;
+  publishedWithinDays?: number | null;
+  requests: number;
+  resultsReturned: number;
+  githubResults: number;
+  droppedNonGithub: number;
+  pass1Candidates: number;
+  pass1Hits: number;
+  gateAccepted: number;
+  gateRejected: number;
+  gateFailed: number;
+  gateBypassed: number;
+  newCodes: number;
+  resultCapFull: boolean;
+  costUsd?: number | null;
+  costSource?: 'response' | 'list-price' | null;
+}
+
+export async function insertExaSearch(pool: pg.Pool, row: ExaSearchInsert): Promise<void> {
+  await pool.query(
+    `INSERT INTO exa_searches (
+       query_key, vendor, status, error_code, search_type, num_results_requested, max_age_hours,
+       published_within_days, requests, results_returned, github_results, dropped_non_github,
+       pass1_candidates, pass1_hits, gate_accepted, gate_rejected, gate_failed, gate_bypassed,
+       new_codes, result_cap_full, cost_usd, cost_source
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+    [
+      row.queryKey.slice(0, 80),
+      row.vendor.slice(0, 100),
+      row.status,
+      row.errorCode ? row.errorCode.slice(0, 80) : null,
+      row.searchType.slice(0, 40),
+      Math.min(100, Math.max(1, Math.floor(row.numResultsRequested))),
+      row.maxAgeHours ?? null,
+      row.publishedWithinDays ?? null,
+      Math.max(0, Math.floor(row.requests)),
+      Math.max(0, Math.floor(row.resultsReturned)),
+      Math.max(0, Math.floor(row.githubResults)),
+      Math.max(0, Math.floor(row.droppedNonGithub)),
+      Math.max(0, Math.floor(row.pass1Candidates)),
+      Math.max(0, Math.floor(row.pass1Hits)),
+      Math.max(0, Math.floor(row.gateAccepted)),
+      Math.max(0, Math.floor(row.gateRejected)),
+      Math.max(0, Math.floor(row.gateFailed)),
+      Math.max(0, Math.floor(row.gateBypassed)),
+      Math.max(0, Math.floor(row.newCodes)),
+      row.resultCapFull,
+      row.costUsd ?? null,
+      row.costSource ?? null
+    ]
+  );
+}
+
+export async function upsertWorkerRuntime(
+  pool: pg.Pool,
+  input: { llmProvider: string; llmModel: string; config: unknown }
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO worker_runtime (id, reported_at, llm_provider, llm_model, config)
+     VALUES (1, now(), $1, $2, $3::jsonb)
+     ON CONFLICT (id) DO UPDATE
+     SET reported_at = now(),
+         llm_provider = EXCLUDED.llm_provider,
+         llm_model = EXCLUDED.llm_model,
+         config = EXCLUDED.config`,
+    [input.llmProvider.slice(0, 40), input.llmModel.slice(0, 80), JSON.stringify(input.config)]
   );
 }
 

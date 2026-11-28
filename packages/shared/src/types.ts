@@ -60,6 +60,12 @@ export interface ScanRunInsert {
   rateLimitRemaining?: number;
   rateLimitLimit?: number;
   rateLimitResource?: string;
+  pagesScanned?: number;
+  reportedTotal?: number;
+  capSaturated?: boolean;
+  rateLimited?: boolean;
+  reportedIncomplete?: boolean;
+  lane?: string;
 }
 
 export interface PromoCodeRow {
