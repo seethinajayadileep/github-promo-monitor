@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { statsErrorLog } from '../lib/safeError';
 import { clampPage, parseDashboardParams, totalPagesFor } from '../lib/promoQuery';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -46,5 +47,15 @@ describe('dashboard query parsing and pagination', () => {
     expect(source).toContain('Asia/Kolkata');
     expect(source).not.toContain('EXA_API_KEY');
     expect(source).not.toContain('process.env');
+    expect(source).toContain('legacyHits');
+  });
+
+  it('logs the database error message without a connection string', () => {
+    const error = Object.assign(new Error('integer out of range for postgres://promo:secret@db.internal:5432/promo'), { code: '22003' });
+    expect(statsErrorLog(error)).toEqual({
+      code: '22003',
+      message: 'integer out of range for [redacted-url]'
+    });
+    expect(statsErrorLog(error).message).not.toContain('secret');
   });
 });

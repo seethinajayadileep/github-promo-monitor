@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { loadDashboardStats, normalizeStatsFilters } from '@promo/shared';
 import { getPool } from '@/lib/db';
+import { statsErrorLog } from '@/lib/safeError';
 import { loadStatsCatalog } from '@/lib/statsCatalog';
 
 export const dynamic = 'force-dynamic';
@@ -18,7 +19,7 @@ export async function GET(request: Request) {
     const stats = await loadDashboardStats(getPool(), filters, loadStatsCatalog());
     return NextResponse.json(stats);
   } catch (error) {
-    console.error('stats API failed', error instanceof Error ? error.name : 'error');
+    console.error('stats API failed', statsErrorLog(error));
     return NextResponse.json({ error: 'stats query failed' }, { status: 500 });
   }
 }

@@ -94,6 +94,71 @@ describe('stats filters', () => {
     expect(istDateString(new Date('2026-11-27T18:30:00Z'))).toBe('2026-11-28');
     expect(normalizeStatsFilters({ model: 'sk-secret' }).model).toBe('');
     expect(normalizeStatsFilters({ lane: 'github' }).lane).toBe('');
+    expect(normalizeStatsFilters({ lane: 'exa' }).lane).toBe('exa');
+  });
+});
+
+describe('scan hit sums above a 32-bit integer', () => {
+  it('does not throw and keeps inflated totals out of hits opened', async () => {
+    const inflated = 2_356_384_782;
+    const pool = {
+      query: async (sql: string) => {
+        if (sql.includes('stats-lane-summary') || sql.includes('stats-surfaces')) {
+          const casts = sql.match(/SUM\(hits_found\)[\s\S]{0,180}?::(?:int|bigint)/gi) ?? [];
+          if (casts.length === 0 || casts.some((part) => /::int\b/i.test(part))) {
+            const error = new Error('integer out of range') as Error & { code?: string };
+            error.code = '22003';
+            throw error;
+          }
+        }
+        if (sql.includes('stats-lane-summary')) {
+          return {
+            rows: [{
+              lane: 'fast',
+              runs: '6982',
+              hits_found: '120',
+              legacy_hits: String(inflated),
+              legacy_runs: '4100',
+              new_codes: '3',
+              pages_scanned: '10',
+              cap_hits: '0',
+              rate_limited_runs: '0',
+              runs_missing_page_detail: '4100',
+              last_scan_at: '2026-11-28T00:00:00.000Z'
+            }]
+          };
+        }
+        if (sql.includes('stats-surfaces')) {
+          return {
+            rows: [{
+              lane: 'fast',
+              surface: 'commits',
+              runs: '6982',
+              hits_found: '80',
+              legacy_hits: String(inflated),
+              legacy_runs: '4100',
+              new_codes: '1',
+              last_scan_at: '2026-11-28T00:00:00.000Z'
+            }]
+          };
+        }
+        return { rows: [] };
+      }
+    };
+    const stats = await loadDashboardStats(pool as never, normalizeStatsFilters({}, new Date('2026-11-28T12:00:00Z')), {
+      now: new Date('2026-11-28T12:00:00Z'),
+      searchQueryCount: 12,
+      codeQueryCount: 4,
+      watchlistRepos: [],
+      filesLoaded: true
+    });
+    const fast = stats.lanes.find((lane) => lane.lane === 'fast');
+    expect(fast?.hitsFound).toBe(120);
+    expect(fast?.legacyHits).toBe(inflated);
+    expect(fast?.legacyHits).toBeGreaterThan(2_147_483_647);
+    expect(stats.surfaces[0]?.hitsFound).toBe(80);
+    expect(stats.surfaces[0]?.legacyHits).toBe(inflated);
+    expect(stats.notes.join(' ')).toContain('1,000');
   });
 });
 
