@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import type { DashboardStats, PublicWorkerConfig } from '@promo/shared';
-import { formatDurationMs, STATS_HONESTY } from '@promo/shared';
+import { formatDurationMs, GITHUB_SEARCH_RESULT_CEILING, STATS_HONESTY } from '@promo/shared';
 
 const LANES = ['', 'fast', 'slow', 'backfill', 'watchlist', 'followed', 'exa'] as const;
 
@@ -263,21 +263,26 @@ export function StatsDashboard({ stats }: { stats: DashboardStats | null }) {
       </Section>
 
       <Section id="lanes" title="Scan lanes">
-        <p className="mb-3 text-sm leading-6 text-slate-400">{stats.honesty.historicalScans} Health uses the worker-reported interval when one exists: stale means the last run is older than three intervals. Cap and rate-limit columns are separate from that label.</p>
+        <p className="mb-3 text-sm leading-6 text-slate-400">{stats.honesty.historicalScans} {stats.honesty.legacyHits} Health uses the worker-reported interval when one exists: stale means the last run is older than three intervals. Cap and rate-limit columns are separate from that label.</p>
+        <p className="mb-3 text-sm leading-6 text-slate-400">
+          Hits opened in this range: {formatInt(stats.lanes.reduce((sum, lane) => sum + lane.hitsFound, 0))}.
+          Stored values not counted as hits opened: {formatInt(stats.lanes.reduce((sum, lane) => sum + lane.legacyHits, 0))} across {formatInt(stats.lanes.reduce((sum, lane) => sum + lane.legacyRuns, 0))} runs.
+          A stored value is excluded when the row did not record pages scanned, or when hits_found is above {GITHUB_SEARCH_RESULT_CEILING}.
+        </p>
         <Table
-          headers={['Lane', 'Health', 'Last scan (IST)', 'Runs', 'Hits', 'New codes', 'Pages', 'Cap hits', 'Rate-limited runs', 'Runs missing page detail']}
-          rows={stats.lanes.map((lane) => [lane.label, lane.health, formatIst(lane.lastScanAt), formatInt(lane.runs), formatInt(lane.hitsFound), formatInt(lane.newCodes), formatInt(lane.pagesScanned), formatInt(lane.capHits), formatInt(lane.rateLimitedRuns), formatInt(lane.runsMissingPageDetail)])}
+          headers={['Lane', 'Health', 'Last scan (IST)', 'Runs', 'Hits opened', 'Stored, not opened', 'New codes', 'Pages', 'Cap hits', 'Rate-limited runs', 'Runs missing page detail']}
+          rows={stats.lanes.map((lane) => [lane.label, lane.health, formatIst(lane.lastScanAt), formatInt(lane.runs), formatInt(lane.hitsFound), lane.legacyRuns ? `${formatInt(lane.legacyHits)} in ${formatInt(lane.legacyRuns)} runs` : '0', formatInt(lane.newCodes), formatInt(lane.pagesScanned), formatInt(lane.capHits), formatInt(lane.rateLimitedRuns), formatInt(lane.runsMissingPageDetail)])}
         />
         <div className="mt-4">
           <Table
-            headers={['Lane', 'Surface', 'Runs', 'Hits', 'New codes', 'Last scan (IST)']}
-            rows={stats.surfaces.map((row) => [row.lane, row.surface, formatInt(row.runs), formatInt(row.hitsFound), formatInt(row.newCodes), formatIst(row.lastScanAt)])}
+            headers={['Lane', 'Surface', 'Runs', 'Hits opened', 'Stored, not opened', 'New codes', 'Last scan (IST)']}
+            rows={stats.surfaces.map((row) => [row.lane, row.surface, formatInt(row.runs), formatInt(row.hitsFound), row.legacyRuns ? `${formatInt(row.legacyHits)} in ${formatInt(row.legacyRuns)} runs` : '0', formatInt(row.newCodes), formatIst(row.lastScanAt)])}
           />
         </div>
         <div className="mt-4">
           <Table
             headers={['When (IST)', 'Lane', 'Query', 'Surface', 'Mode', 'Window', 'Hits', 'Reported', 'Pages', 'Cap', 'Rate limited', 'New codes']}
-            rows={stats.recentRuns.map((row) => [formatIst(row.ranAt), row.lane, row.queryKey, row.surface, row.mode, row.cursorWindow, formatInt(row.hitsFound), row.reportedTotal == null ? '—' : formatInt(row.reportedTotal), row.pagesScanned == null ? '—' : formatInt(row.pagesScanned), row.capSaturated == null ? '—' : String(row.capSaturated), row.rateLimited == null ? '—' : String(row.rateLimited), formatInt(row.newCodes)])}
+            rows={stats.recentRuns.map((row) => [formatIst(row.ranAt), row.lane, row.queryKey, row.surface, row.mode, row.cursorWindow, formatStoredHits(row.hitsFound, row.pagesScanned), row.reportedTotal == null ? '—' : formatInt(row.reportedTotal), row.pagesScanned == null ? '—' : formatInt(row.pagesScanned), row.capSaturated == null ? '—' : String(row.capSaturated), row.rateLimited == null ? '—' : String(row.rateLimited), formatInt(row.newCodes)])}
           />
         </div>
       </Section>
@@ -351,6 +356,11 @@ export function StatsDashboard({ stats }: { stats: DashboardStats | null }) {
       </section>
     </main>
   );
+}
+
+function formatStoredHits(hits: number, pagesScanned: number | null): string {
+  if (pagesScanned == null || hits > GITHUB_SEARCH_RESULT_CEILING) return `${formatInt(hits)} stored, not opened`;
+  return formatInt(hits);
 }
 
 function bucketLine(stats: DashboardStats, key: 'search' | 'code_search'): string {

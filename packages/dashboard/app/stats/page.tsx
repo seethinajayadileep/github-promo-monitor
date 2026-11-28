@@ -1,6 +1,7 @@
 import { loadDashboardStats, normalizeStatsFilters } from '@promo/shared';
 import { StatsDashboard } from '@/components/StatsDashboard';
 import { getPool } from '@/lib/db';
+import { statsErrorLog } from '@/lib/safeError';
 import { loadStatsCatalog } from '@/lib/statsCatalog';
 
 export const dynamic = 'force-dynamic';
@@ -22,7 +23,7 @@ export default async function StatsPage({
     const stats = await loadDashboardStats(getPool(), filters, loadStatsCatalog());
     return <StatsDashboard stats={stats} />;
   } catch (error) {
-    console.error('stats page failed', error instanceof Error ? error.name : 'error');
+    console.error('stats page failed', statsErrorLog(error));
     return <StatsDashboard stats={null} />;
   }
 }

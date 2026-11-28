@@ -1,6 +1,6 @@
 import { isIsoDate, istDateString, istDayStart, shiftIstDate } from './ist.js';
 
-export const STATS_LANES = ['fast', 'slow', 'backfill', 'watchlist', 'followed'] as const;
+export const STATS_LANES = ['fast', 'slow', 'backfill', 'watchlist', 'followed', 'exa'] as const;
 export type StatsLane = (typeof STATS_LANES)[number];
 
 export interface NormalizedStatsFilters {

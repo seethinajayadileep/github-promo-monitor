@@ -7,6 +7,7 @@ export const STATS_HONESTY = {
   unopened: 'Unopened hits are documents inside one query window that this scan did not open because the page cap or a rate limit stopped it. The searchable ceiling for one query is 1,000 hits. Hits above that ceiling were never available from the search API.',
   historicalTokens: 'Token totals include only LLM calls stored after usage logging shipped. Earlier calls were not stored, so historical input, output, cached tokens, and cost stay at zero until new calls run.',
   historicalScans: 'Page counts, GitHub reported totals, and cap flags are stored from scans that run after this version. Older retained scan rows leave those fields blank and are not treated as cap-saturated.',
+  legacyHits: 'Older scan rows saved GitHub\'s reported total_count in hits_found, including values above the 1,000-hit search ceiling. Hits opened counts only rows that recorded pages scanned and stored at most 1,000 hits. Larger or pre-detail values are listed separately and are not backfilled.',
   ist: 'All timestamps on this page use Asia/Kolkata (IST).',
   noSecrets: 'This page does not show API keys, GitHub tokens, prompts, or rejected snippet text.'
 } as const;

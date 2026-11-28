@@ -6,6 +6,7 @@ import { llmRateCard } from './llmUsage.js';
 import {
   estimateQueryCycle,
   followedPassEstimate,
+  GITHUB_SEARCH_RESULT_CEILING,
   gapsBetweenIsoTimes,
   laneHealth,
   STATS_HONESTY,
@@ -133,6 +134,8 @@ export interface DashboardStats {
     label: string;
     runs: number;
     hitsFound: number;
+    legacyHits: number;
+    legacyRuns: number;
     newCodes: number;
     pagesScanned: number;
     capHits: number;
@@ -146,6 +149,8 @@ export interface DashboardStats {
     surface: string;
     runs: number;
     hitsFound: number;
+    legacyHits: number;
+    legacyRuns: number;
     newCodes: number;
     lastScanAt: string | null;
   }>;
@@ -590,9 +595,9 @@ function mapTokenRow(row: Record<string, unknown>, bucket: string): TokenBucket 
 const TOKEN_COLUMNS = `model,
   MIN(provider) AS provider,
   BOOL_OR(cost_estimated) AS cost_estimated,
-  COALESCE(SUM(prompt_tokens), 0)::int AS prompt_tokens,
-  COALESCE(SUM(completion_tokens), 0)::int AS completion_tokens,
-  COALESCE(SUM(cached_tokens), 0)::int AS cached_tokens,
+  COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens,
+  COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+  COALESCE(SUM(cached_tokens), 0)::bigint AS cached_tokens,
   COALESCE(SUM(cost_usd) FILTER (WHERE cost_estimated), 0)::float8 AS estimated_cost_usd,
   COUNT(*)::int AS requests,
   COUNT(*) FILTER (WHERE status = 'success')::int AS success,
@@ -834,15 +839,20 @@ export async function loadDashboardStats(
     ? 'pages_scanned, reported_total, cap_saturated, rate_limited, reported_incomplete'
     : 'NULL::int AS pages_scanned, NULL::int AS reported_total, NULL::boolean AS cap_saturated, NULL::boolean AS rate_limited, NULL::boolean AS reported_incomplete';
 
+  const openedHitsSql = `COALESCE(SUM(hits_found) FILTER (WHERE pages_scanned IS NOT NULL AND hits_found <= ${GITHUB_SEARCH_RESULT_CEILING}), 0)::bigint`;
+  const legacyHitsSql = `COALESCE(SUM(hits_found) FILTER (WHERE pages_scanned IS NULL OR hits_found > ${GITHUB_SEARCH_RESULT_CEILING}), 0)::bigint`;
+  const legacyRunsSql = `COUNT(*) FILTER (WHERE pages_scanned IS NULL OR hits_found > ${GITHUB_SEARCH_RESULT_CEILING})::bigint`;
   const laneRows = await rowsOf<Record<string, unknown>>(pool, `/* stats-lane-summary */
     SELECT derived_lane AS lane,
-      COUNT(*)::int AS runs,
-      COALESCE(SUM(hits_found), 0)::int AS hits_found,
-      COALESCE(SUM(new_codes), 0)::int AS new_codes,
-      COALESCE(SUM(pages_scanned), 0)::int AS pages_scanned,
-      COUNT(*) FILTER (WHERE cap_saturated IS TRUE)::int AS cap_hits,
-      COUNT(*) FILTER (WHERE rate_limited IS TRUE)::int AS rate_limited_runs,
-      COUNT(*) FILTER (WHERE pages_scanned IS NULL)::int AS runs_missing_page_detail,
+      COUNT(*)::bigint AS runs,
+      ${openedHitsSql} AS hits_found,
+      ${legacyHitsSql} AS legacy_hits,
+      ${legacyRunsSql} AS legacy_runs,
+      COALESCE(SUM(new_codes), 0)::bigint AS new_codes,
+      COALESCE(SUM(pages_scanned), 0)::bigint AS pages_scanned,
+      COUNT(*) FILTER (WHERE cap_saturated IS TRUE)::bigint AS cap_hits,
+      COUNT(*) FILTER (WHERE rate_limited IS TRUE)::bigint AS rate_limited_runs,
+      COUNT(*) FILTER (WHERE pages_scanned IS NULL)::bigint AS runs_missing_page_detail,
       MAX(ran_at) AS last_scan_at
     FROM (
       SELECT hits_found, new_codes, ran_at, ${detailColumns}, ${laneExpr} AS derived_lane
@@ -856,12 +866,14 @@ export async function loadDashboardStats(
   const surfaceRows = await rowsOf<Record<string, unknown>>(pool, `/* stats-surfaces */
     SELECT derived_lane AS lane,
       surface_group AS surface,
-      COUNT(*)::int AS runs,
-      COALESCE(SUM(hits_found), 0)::int AS hits_found,
-      COALESCE(SUM(new_codes), 0)::int AS new_codes,
+      COUNT(*)::bigint AS runs,
+      ${openedHitsSql} AS hits_found,
+      ${legacyHitsSql} AS legacy_hits,
+      ${legacyRunsSql} AS legacy_runs,
+      COALESCE(SUM(new_codes), 0)::bigint AS new_codes,
       MAX(ran_at) AS last_scan_at
     FROM (
-      SELECT hits_found, new_codes, ran_at, ${laneExpr} AS derived_lane, ${surfaceExpression()} AS surface_group
+      SELECT hits_found, new_codes, ran_at, ${detailColumns}, ${laneExpr} AS derived_lane, ${surfaceExpression()} AS surface_group
       FROM scan_runs
       WHERE ran_at >= $1 AND ran_at < $2
     ) scans
@@ -964,9 +976,9 @@ export async function loadDashboardStats(
   if (flags.llmCalls) {
     const totals = await oneOf<Record<string, unknown>>(pool, `/* stats-tokens */
       SELECT
-        COALESCE(SUM(prompt_tokens), 0)::int AS prompt_tokens,
-        COALESCE(SUM(completion_tokens), 0)::int AS completion_tokens,
-        COALESCE(SUM(cached_tokens), 0)::int AS cached_tokens,
+        COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens,
+        COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+        COALESCE(SUM(cached_tokens), 0)::bigint AS cached_tokens,
         COALESCE(SUM(cost_usd) FILTER (WHERE cost_estimated), 0)::float8 AS estimated_cost_usd,
         COUNT(*)::int AS requests,
         COUNT(*) FILTER (WHERE cost_estimated)::int AS priced_requests,
@@ -1110,6 +1122,8 @@ export async function loadDashboardStats(
       label: laneLabel(lane),
       runs: int(row?.runs),
       hitsFound: int(row?.hits_found),
+      legacyHits: int(row?.legacy_hits),
+      legacyRuns: int(row?.legacy_runs),
       newCodes: int(row?.new_codes),
       pagesScanned: int(row?.pages_scanned),
       capHits: int(row?.cap_hits),
@@ -1249,6 +1263,7 @@ export async function loadDashboardStats(
   note('Scan run rows older than the worker retention window are deleted, except backfill window-completion markers. LLM usage and gate rows are kept. A wide date range will not bring pruned scans back.');
   note('Newly seen repos are owner/name values whose earliest stored appearance falls in the window. That is discovery inside this system, not a GitHub-wide list of repos that became available.');
   note('Individual pushes are not stored. A new sighting is a new source URL. A last-seen update is a canonical promo touched again, including codes first seen before the window.');
+  if (lanes.some((lane) => lane.legacyRuns > 0)) note(STATS_HONESTY.legacyHits);
 
   return {
     generatedAt: catalog.now.toISOString(),
@@ -1348,6 +1363,8 @@ export async function loadDashboardStats(
       surface: text(row.surface) ?? '',
       runs: int(row.runs),
       hitsFound: int(row.hits_found),
+      legacyHits: int(row.legacy_hits),
+      legacyRuns: int(row.legacy_runs),
       newCodes: int(row.new_codes),
       lastScanAt: iso(row.last_scan_at)
     })),
