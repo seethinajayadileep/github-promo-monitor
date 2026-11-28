@@ -7,13 +7,16 @@ import {
   GITHUB_SEARCH_MAX_OPERATORS,
   GITHUB_SEARCH_QUALIFIER_RESERVE,
   addCommitDateWindow,
+  addIssueDateWindow,
   addIssueQualifier,
   addRecentCommitDateWindow,
   buildCodeSearchQueries,
   buildSearchQueries,
   collectVendorSearchTerms,
   countBooleanOperators,
+  halveSearchWindow,
   isValidGitHubSearchQuery,
+  parseBoundedWindow,
   promoCueQuery
 } from '../src/queryPlanner.js';
 import type { VendorConfig } from '../src/types.js';
@@ -66,11 +69,11 @@ describe('GitHub query planner', () => {
 
   it('keeps every generated query for all live vendors within GitHub Search limits', () => {
     expect(liveVendors).toHaveLength(48);
-    const queries = buildSearchQueries(liveVendors);
-    expect(queries.length).toBeGreaterThan(0);
-    // 12 queries × (commits + issues) stays under GitHub's 30 search req/min.
-    expect(queries.length).toBeLessThanOrEqual(15);
     const terms = collectVendorSearchTerms(liveVendors);
+    const queries = buildSearchQueries(liveVendors);
+    expect(queries.length).toBe(terms.length);
+    expect(queries.length).toBeGreaterThan(15);
+    expect(queries.every((query) => !/AND \([^)]*\bOR\b/i.test(query))).toBe(true);
     expect(terms).toContain('OpenAI');
     expect(terms).toContain('ChatGPT');
     expect(terms).not.toContain('"OpenAI API"');
@@ -86,6 +89,7 @@ describe('GitHub query planner', () => {
       expect(isValidGitHubSearchQuery(addCommitDateWindow(query, '2020-01-01', '2020-01-07'))).toBe(true);
       expect(isValidGitHubSearchQuery(addIssueQualifier(query, 'issue'))).toBe(true);
       expect(isValidGitHubSearchQuery(addIssueQualifier(query, 'pr'))).toBe(true);
+      expect(isValidGitHubSearchQuery(addCommitDateWindow(query, '2026-11-27T00:00:00Z', '2026-11-27T01:00:00Z'))).toBe(true);
     }
   });
 
@@ -100,6 +104,20 @@ describe('GitHub query planner', () => {
     }
     expect(queries.some((query) => query === '"promo code" OpenAI filename:README.md')).toBe(true);
     expect(queries.some((query) => query === 'coupon Vercel path:docs')).toBe(true);
+  });
+
+  it('slices a date window in half until an hour remains', () => {
+    const bounds = parseBoundedWindow('2026-11-27..2026-11-28');
+    expect(bounds).not.toBeNull();
+    const halves = halveSearchWindow(bounds!.start, bounds!.endExclusive);
+    expect(halves).not.toBeNull();
+    expect(halves!.left < halves!.right).toBe(true);
+    const hour = parseBoundedWindow('2026-11-27T00:00:00Z..2026-11-27T01:00:00Z');
+    expect(halveSearchWindow(hour!.start, hour!.endExclusive)).toBeNull();
+    const issue = addIssueDateWindow('("promo code" OR coupon) AND Claude', '2026-11-27', '2026-11-28');
+    expect(issue).toContain('is:issue');
+    expect(issue).toContain('created:2026-11-27..2026-11-28');
+    expect(issue).not.toMatch(/AND \([^)]*\bOR\b/i);
   });
 
   it('uses a promo cue that is already within the operator limit', () => {

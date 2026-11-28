@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import type { ExtractedPromo } from './types.js';
+
 export const GPT6_LUNA_INPUT_USD_PER_MILLION = 0.1;
 export const GPT6_LUNA_OUTPUT_USD_PER_MILLION = 0.5;
 
@@ -24,8 +27,19 @@ export interface LlmUsageRecord {
   costEstimated: boolean;
 }
 
+export function hashLlmInput(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+export interface LlmCacheHit {
+  outcome: 'accepted' | 'rejected';
+  result?: ExtractedPromo;
+}
+
 export interface LlmCallContext {
   onCall?: (record: LlmUsageRecord) => void | Promise<void>;
+  lookupCache?: (hash: string) => Promise<LlmCacheHit | null>;
+  storeCache?: (hash: string, hit: LlmCacheHit) => Promise<void>;
 }
 
 export interface LlmCostEstimate {

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CODE_SEARCH_MIN_GAP_MS,
   GitHubClient,
+  GitHubTokenPool,
+  SEARCH_MIN_GAP_MS,
   SECONDARY_RATE_LIMIT_MIN_WAIT_MS,
   formatGitHubError,
   inferRateLimitResource,
@@ -151,7 +154,7 @@ describe('secondary rate-limit backoff', () => {
     }
   });
 
-  it('does not hold the request lock during secondary backoff, so other lanes continue', async () => {
+  it('holds the request lock during secondary backoff so other lanes wait', async () => {
     const sleepers: Array<{ ms: number; resolve: () => void }> = [];
     let searchCalls = 0;
     let coreCalls = 0;
@@ -196,16 +199,47 @@ describe('secondary rate-limit backoff', () => {
       const corePromise = client.request('/repos/acme/demo/commits?per_page=5');
       const coreResult = await Promise.race([
         corePromise.then(() => 'completed'),
-        new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 100))
+        new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 80))
       ]);
-      expect(coreResult).toBe('completed');
-      expect(coreCalls).toBe(1);
+      expect(coreResult).toBe('blocked');
+      expect(coreCalls).toBe(0);
       sleepers.forEach((sleeper) => sleeper.resolve());
       const search = await searchPromise;
       expect(search.status).toBe(200);
       expect(searchCalls).toBe(2);
+      await corePromise;
+      expect(coreCalls).toBe(1);
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('spaces shared search requests at 30/min and code search at 10/min', async () => {
+    const waits: number[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => jsonResponse(200, { items: [], total_count: 0 }, {
+      'x-ratelimit-remaining': '20',
+      'x-ratelimit-limit': '30',
+      'x-ratelimit-resource': 'search'
+    })) as typeof fetch;
+    try {
+      const client = new GitHubClient({ GITHUB_TOKEN: 'one', GITHUB_TOKENS: 'two' }, {
+        sleep: async (ms) => { waits.push(ms); }
+      });
+      await client.request('/search/commits?q=a');
+      await client.request('/search/commits?q=b');
+      await client.request('/search/code?q=c');
+      await client.request('/search/code?q=d');
+      expect(waits.some((ms) => ms >= SEARCH_MIN_GAP_MS - 50 && ms < 4_000)).toBe(true);
+      expect(waits.some((ms) => ms >= CODE_SEARCH_MIN_GAP_MS - 50)).toBe(true);
+      expect(new GitHubTokenPool({ GITHUB_TOKEN: 'one', GITHUB_TOKENS: 'two, one' }).size).toBe(2);
+      expect(new GitHubTokenPool({ GITHUB_TOKENS: 'alpha,beta' }).size).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('honors x-ratelimit-reset when it is longer than Retry-After', () => {
+    expect(secondaryRateLimitBackoffMs('10', { now: 0, jitterMs: 0, reset: 180 })).toBe(180_000);
   });
 });

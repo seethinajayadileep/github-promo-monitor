@@ -22,18 +22,14 @@ export function laneFromQueryKey(queryKey: string): string {
   return 'other';
 }
 
+/** True when GitHub reported more hits than this scan opened, including totals above the 1,000-hit ceiling. */
 export function searchPageCapSaturated(input: {
-  pagesScanned: number;
-  maxPages: number;
   hitsFetched: number;
   reportedTotal: number;
-  stoppedOnShortPage: boolean;
   pageFailed: boolean;
 }): boolean {
-  if (input.pageFailed || input.stoppedOnShortPage) return false;
-  if (input.maxPages <= 0 || input.pagesScanned < input.maxPages) return false;
-  const ceiling = Math.min(Math.max(0, input.reportedTotal), GITHUB_SEARCH_RESULT_CEILING);
-  return input.hitsFetched < ceiling;
+  if (input.pageFailed || input.reportedTotal <= 0) return false;
+  return input.reportedTotal > input.hitsFetched;
 }
 
 export function singlePageWasFull(hitsFetched: number, pageSize: number): boolean {

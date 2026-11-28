@@ -1,9 +1,15 @@
 import {
   BACKFILL_WINDOW_COMPLETE_KEY,
+  GITHUB_SEARCH_RESULT_CEILING,
   GitHubClient,
   addCommitDateWindow,
+  addIssueDateWindow,
   addIssueQualifier,
   addRecentCommitDateWindow,
+  halveSearchWindow,
+  hasSeenCommitSha,
+  pagesNeededForTotal,
+  parseBoundedWindow,
   advanceLaneCursor,
   buildCodeSearchQueries,
   buildSearchQueries,
@@ -15,6 +21,7 @@ import {
   enrichAndGateCandidates,
   extractPassOne,
   getLaneCursor,
+  getLaneCursorState,
   insertLlmCall,
   insertLlmGateEvent,
   insertScanRun,
@@ -27,11 +34,15 @@ import {
   markFollowedRepoPolled,
   notifyAll,
   previousBackfillWindow,
+  readLlmInputCache,
+  rememberCommitSha,
   rememberFollowedRepo,
   searchPageCapSaturated,
   singlePageWasFull,
   syncFollowedRepos,
   upsertPromoCandidate,
+  writeLlmInputCache,
+  type ExtractedPromo,
   type GitHubResponse,
   type LlmUsageRecord,
   type PromoCandidate,
@@ -79,6 +90,8 @@ export interface IngestCounts {
 function emptyIngest(): IngestCounts {
   return { newCodes: 0, pass1Candidates: 0, pass1Hits: 0, gateAccepted: 0, gateRejected: 0, gateFailed: 0, gateBypassed: 0 };
 }
+
+const seenCommitKeys = new Set<string>();
 
 function log(event: string, details: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ event, at: new Date().toISOString(), ...details }));
@@ -169,7 +182,24 @@ export async function ingestObservedText(
   }, {
     onCall: (record: LlmUsageRecord) => insertLlmCall(pool, record).catch((error) => {
       log('llm_usage_persist_failed', { error: error instanceof Error ? error.message : 'unknown' });
-    })
+    }),
+    lookupCache: async (hash) => {
+      const row = await readLlmInputCache(pool, hash);
+      if (!row) return null;
+      if (row.outcome === 'rejected') return { outcome: 'rejected' };
+      if (!row.resultJson) return { outcome: 'rejected' };
+      try {
+        return { outcome: 'accepted', result: JSON.parse(row.resultJson) as ExtractedPromo };
+      } catch {
+        return null;
+      }
+    },
+    storeCache: async (hash, hit) => {
+      const json = hit.outcome === 'accepted' && hit.result
+        ? JSON.stringify({ ...hit.result, expiresAt: hit.result.expiresAt ? new Date(hit.result.expiresAt).toISOString() : undefined })
+        : null;
+      await writeLlmInputCache(pool, hash, hit.outcome, json);
+    }
   }));
   for (const candidate of candidates) {
     const result = await upsertPromoCandidate(pool, candidate);
@@ -213,11 +243,16 @@ async function scanCommitItems(
     const repoFullName = item.repository?.full_name ?? 'unknown/unknown';
     const sourceDate = dateOrUndefined(item.commit?.committer?.date ?? item.commit?.author?.date);
     let text = item.commit?.message ?? '';
-    if (detailsFetched < config.maxCommitDetailsPerScan && repoFullName !== 'unknown/unknown' && item.sha) {
+    const seenKey = item.sha ? `${repoFullName}@${item.sha}` : '';
+    const alreadySeen = Boolean(seenKey && (seenCommitKeys.has(seenKey) || await hasSeenCommitSha(options.pool, repoFullName, item.sha)));
+    if (alreadySeen && seenKey) seenCommitKeys.add(seenKey);
+    if (!alreadySeen && detailsFetched < config.maxCommitDetailsPerScan && repoFullName !== 'unknown/unknown' && item.sha) {
       try {
         const detail = await commitDetailText(options.github, repoFullName, item.sha);
         text = detail.text;
         detailsFetched += 1;
+        seenCommitKeys.add(seenKey);
+        await rememberCommitSha(options.pool, repoFullName, item.sha);
       } catch (error) {
         log('commit_detail_failed', { repoFullName, sha: item.sha, error: error instanceof Error ? error.message : 'unknown' });
       }
@@ -335,11 +370,35 @@ async function scanCommitSearch(
     reportedIncomplete = reportedIncomplete || Boolean(response.data?.incomplete_results);
     allItems.push(...items);
     lastPageFull = items.length >= config.searchPageSize;
+    if (
+      page === 1
+      && !response.notModified
+      && totalCount > GITHUB_SEARCH_RESULT_CEILING
+    ) {
+      const split = splitDatedQuery(query, 'committer-date');
+      if (split) {
+        const left = await scanCommitSearch(options, split.leftQuery, queryKey, mode, split.leftSpec);
+        const right = await scanCommitSearch(options, split.rightQuery, queryKey, mode, split.rightSpec);
+        return {
+          hitsFound: left.hitsFound + right.hitsFound,
+          newCodes: left.newCodes + right.newCodes,
+          rateLimitRemaining: right.rateLimitRemaining ?? left.rateLimitRemaining,
+          etag: right.etag ?? left.etag,
+          complete: left.complete && right.complete,
+          pagesScanned: left.pagesScanned + right.pagesScanned
+        };
+      }
+    }
     if (response.notModified || !lastPageFull) break;
     const scannedCount = uniqueCommitItems(allItems).length;
-    if (totalCount > 0 && scannedCount >= Math.min(totalCount, 1000)) break;
+    const needed = pagesNeededForTotal(totalCount, config.searchPageSize, config.maxCommitSearchPages);
+    if (totalCount > 0 && scannedCount >= Math.min(totalCount, GITHUB_SEARCH_RESULT_CEILING)) break;
+    if (page >= needed) {
+      if (totalCount > scannedCount) complete = false;
+      break;
+    }
     if (page === config.maxCommitSearchPages) {
-      complete = totalCount > 0 ? scannedCount >= Math.min(totalCount, 1000) : false;
+      complete = totalCount > 0 ? scannedCount >= Math.min(totalCount, GITHUB_SEARCH_RESULT_CEILING) : false;
     } else {
       await options.github.paceIfNeeded(response.rateLimit, minimumRateLimitPercent);
     }
@@ -358,11 +417,8 @@ async function scanCommitSearch(
     pagesScanned,
     reportedTotal: totalCount,
     capSaturated: searchPageCapSaturated({
-      pagesScanned,
-      maxPages: config.maxCommitSearchPages,
       hitsFetched: items.length,
       reportedTotal: totalCount,
-      stoppedOnShortPage: !lastPageFull,
       pageFailed
     }),
     rateLimited,
@@ -398,7 +454,7 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
   const cacheKey = `search:issues:${queryKey}`;
   const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, 'issues');
   if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
-  const issueQuery = addIssueQualifier(query, 'issue');
+  const issueQuery = query.includes(' created:') ? query : addIssueDateWindow(query, ...liveDateEnds(config.liveCommitWindowDays));
   const allItems: IssueSearchItem[] = [];
   let pagesScanned = 0;
   let totalCount = 0;
@@ -428,8 +484,24 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
     reportedIncomplete = reportedIncomplete || Boolean(response.data?.incomplete_results);
     allItems.push(...pageItems);
     lastPageFull = pageItems.length >= config.searchPageSize;
+    if (page === 1 && !response.notModified && totalCount > GITHUB_SEARCH_RESULT_CEILING) {
+      const split = splitDatedQuery(issueQuery, 'created');
+      if (split) {
+        const left = await scanIssueSearch(options, split.leftQuery, queryKey, mode);
+        const right = await scanIssueSearch(options, split.rightQuery, queryKey, mode);
+        return {
+          hitsFound: left.hitsFound + right.hitsFound,
+          newCodes: left.newCodes + right.newCodes,
+          rateLimitRemaining: right.rateLimitRemaining ?? left.rateLimitRemaining,
+          etag: right.etag ?? left.etag
+        };
+      }
+    }
     if (response.notModified || !lastPageFull) break;
-    if (uniqueIssueItems(allItems).length >= Math.min(totalCount || 1000, 1000)) break;
+    const scannedCount = uniqueIssueItems(allItems).length;
+    const needed = pagesNeededForTotal(totalCount, config.searchPageSize, config.maxIssueSearchPages);
+    if (totalCount > 0 && scannedCount >= Math.min(totalCount, GITHUB_SEARCH_RESULT_CEILING)) break;
+    if (page >= needed) break;
     if (page < config.maxIssueSearchPages) {
       await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
     }
@@ -456,11 +528,8 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
     pagesScanned,
     reportedTotal: totalCount,
     capSaturated: searchPageCapSaturated({
-      pagesScanned,
-      maxPages: config.maxIssueSearchPages,
       hitsFetched: items.length,
       reportedTotal: totalCount,
-      stoppedOnShortPage: !lastPageFull,
       pageFailed
     }),
     rateLimited,
@@ -538,7 +607,9 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
     allItems.push(...pageItems);
     lastPageFull = pageItems.length >= config.searchPageSize;
     if (response.notModified || !lastPageFull) break;
-    if (totalCount > 0 && uniqueCodeItems(allItems).length >= Math.min(totalCount, 1000)) break;
+    const scannedCount = uniqueCodeItems(allItems).length;
+    if (totalCount > 0 && scannedCount >= Math.min(totalCount, GITHUB_SEARCH_RESULT_CEILING)) break;
+    if (page >= pagesNeededForTotal(totalCount, config.searchPageSize, config.maxCodeSearchPages)) break;
     if (page < config.maxCodeSearchPages) {
       await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
     }
@@ -575,11 +646,8 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
     pagesScanned,
     reportedTotal: totalCount,
     capSaturated: searchPageCapSaturated({
-      pagesScanned,
-      maxPages: config.maxCodeSearchPages,
       hitsFetched: items.length,
       reportedTotal: totalCount,
-      stoppedOnShortPage: !lastPageFull,
       pageFailed
     }),
     rateLimited,
@@ -621,11 +689,16 @@ async function pollRepoCommits(options: PollerOptions, poll: RepoCommitPoll): Pr
   let detailsFetched = 0;
   for (const item of items) {
     let text = item.commit?.message ?? '';
-    if (detailsFetched < poll.maxDetails && item.sha) {
+    const seenKey = item.sha ? `${poll.repo}@${item.sha}` : '';
+    const alreadySeen = Boolean(seenKey && (seenCommitKeys.has(seenKey) || await hasSeenCommitSha(options.pool, poll.repo, item.sha)));
+    if (alreadySeen && seenKey) seenCommitKeys.add(seenKey);
+    if (!alreadySeen && detailsFetched < poll.maxDetails && item.sha) {
       detailsFetched += 1;
       try {
         const detail = await commitDetailText(options.github, poll.repo, item.sha);
         text = detail.text;
+        seenCommitKeys.add(seenKey);
+        await rememberCommitSha(options.pool, poll.repo, item.sha);
       } catch (error) {
         log('repo_commit_detail_failed', {
           lane: poll.lane,
@@ -714,6 +787,29 @@ export async function scanWatchlist(options: PollerOptions): Promise<void> {
   }
 }
 
+function liveDateEnds(days: number, now = new Date()): [string, string] {
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - Math.max(1, Math.floor(days)) + 1);
+  const iso = (date: Date) => date.toISOString().slice(0, 10);
+  return [iso(start), iso(end)];
+}
+
+function splitDatedQuery(query: string, qualifier: 'committer-date' | 'created'): { leftQuery: string; rightQuery: string; leftSpec: string; rightSpec: string } | null {
+  const match = query.match(new RegExp(`^(.*) ${qualifier}:(\\S+\\.\\.\\S+)$`));
+  if (!match) return null;
+  const bounds = parseBoundedWindow(match[2]);
+  if (!bounds) return null;
+  const halves = halveSearchWindow(bounds.start, bounds.endExclusive);
+  if (!halves) return null;
+  const base = match[1];
+  const qualify = (spec: string) => {
+    const [start, end] = spec.split('..');
+    return `${base} ${qualifier}:${start}..${end}`;
+  };
+  return { leftQuery: qualify(halves.left), rightQuery: qualify(halves.right), leftSpec: halves.left, rightSpec: halves.right };
+}
+
 function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
@@ -766,27 +862,34 @@ async function scanBackfillQueryRange(
 
 export async function scanHistoricalBackfill(options: PollerOptions): Promise<void> {
   if (!config.backfillEnabled) return;
+  const queries = buildSearchQueries(options.vendors);
+  if (!queries.length) return;
   const lastWindow = await latestBackfillWindow(options.pool);
   const window = previousWindow(lastWindow, config.backfillDaysPerWindow);
   if (new Date(window.end).getTime() < new Date(config.backfillStopDate).getTime()) return;
   const cursorWindow = `${window.start}..${window.end}`;
-  const queries = buildSearchQueries(options.vendors);
-  let incompleteQueries = 0;
-  for (let index = 0; index < queries.length; index += 1) {
-    const complete = await scanBackfillQueryRange(options, queries[index], index, window.start, window.end);
-    if (!complete) incompleteQueries += 1;
-  }
-  if (incompleteQueries > 0) {
-    log('backfill_window_incomplete', { cursorWindow, incompleteQueries });
+  const saved = await getLaneCursorState(options.pool, 'backfill');
+  const index = saved.cursorWindow === cursorWindow ? saved.nextIndex % queries.length : 0;
+  const complete = await scanBackfillQueryRange(options, queries[index], index, window.start, window.end);
+  if (!complete) {
+    await advanceLaneCursor(options.pool, 'backfill', index, cursorWindow);
+    log('backfill_window_incomplete', { cursorWindow, index, queryCount: queries.length });
     return;
   }
-  await insertScanRun(options.pool, {
-    queryKey: BACKFILL_WINDOW_COMPLETE_KEY,
-    surface: 'window-complete',
-    mode: 'backfill',
-    cursorWindow,
-    hitsFound: 0,
-    newCodes: 0
-  });
-  log('backfill_window_complete', { cursorWindow });
+  const next = index + 1;
+  if (next >= queries.length) {
+    await insertScanRun(options.pool, {
+      queryKey: BACKFILL_WINDOW_COMPLETE_KEY,
+      surface: 'window-complete',
+      mode: 'backfill',
+      cursorWindow,
+      hitsFound: 0,
+      newCodes: 0
+    });
+    await advanceLaneCursor(options.pool, 'backfill', 0, null);
+    log('backfill_window_complete', { cursorWindow, queryCount: queries.length });
+    return;
+  }
+  await advanceLaneCursor(options.pool, 'backfill', next, cursorWindow);
+  log('backfill_query_complete', { cursorWindow, index, next, queryCount: queries.length });
 }

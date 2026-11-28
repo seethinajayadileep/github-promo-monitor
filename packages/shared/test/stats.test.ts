@@ -60,13 +60,15 @@ describe('honest scan progress', () => {
 
   it('does not treat a search total above 1000 as fetchable hits', () => {
     expect(searchPageCapSaturated({
-      pagesScanned: 10,
-      maxPages: 10,
-      hitsFetched: 100,
+      hitsFetched: 1000,
       reportedTotal: 5000,
-      stoppedOnShortPage: false,
       pageFailed: false
     })).toBe(true);
+    expect(searchPageCapSaturated({
+      hitsFetched: 40,
+      reportedTotal: 40,
+      pageFailed: false
+    })).toBe(false);
     expect(unopenedSearchHits({ hitsFetched: 100, reportedTotal: 5000, capSaturated: true, rateLimited: false })).toEqual({ hits: 900, reason: 'cap' });
     expect(unopenedSearchHits({ hitsFetched: 100, reportedTotal: 5000, capSaturated: false, rateLimited: false }).hits).toBeNull();
   });

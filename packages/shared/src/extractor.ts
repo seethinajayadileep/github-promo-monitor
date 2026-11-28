@@ -1,5 +1,5 @@
 import { canonicalCode } from './dedupe.js';
-import { buildLlmUsageRecord, parseProviderUsage, type LlmCallContext } from './llmUsage.js';
+import { buildLlmUsageRecord, hashLlmInput, parseProviderUsage, type LlmCacheHit, type LlmCallContext } from './llmUsage.js';
 import { rejectSecrets } from './secrets.js';
 import { isCryptoOrSpam } from './spam.js';
 import { sanitizeRedeemUrl } from './urls.js';
@@ -1012,7 +1012,24 @@ export async function enrichAndGateCandidates(
   const enriched: PromoCandidate[] = [];
   for (const candidate of candidates) {
     try {
-      const outcome = await extractWithLlmDetailed(candidate.llmContext ?? candidate.snippet, vendors, context);
+      const inputText = candidate.llmContext ?? candidate.snippet;
+      const inputHash = hashLlmInput(inputText);
+      const cached = await context?.lookupCache?.(inputHash);
+      if (cached?.outcome === 'rejected') {
+        onEvent?.('llm_gate_rejected', { vendor: candidate.vendor, code: candidate.code, reason: 'cached-rejection' });
+        continue;
+      }
+      if (cached?.outcome === 'accepted' && cached.result) {
+        const applied = expandLlmCandidates(candidate, cached.result, vendors);
+        if (!applied.length) {
+          onEvent?.('llm_gate_rejected', { vendor: candidate.vendor, code: candidate.code, reason: 'cached-rejection' });
+          continue;
+        }
+        onEvent?.('llm_gate_accepted', { vendor: candidate.vendor, code: candidate.code, accepted: applied.length, cached: true });
+        enriched.push(...applied);
+        continue;
+      }
+      const outcome = await extractWithLlmDetailed(inputText, vendors, context);
       const llm = outcome.result;
       if (!llm) {
         onEvent?.('llm_gate_failed', { vendor: candidate.vendor, code: candidate.code, reason: outcome.failureReason ?? 'unknown' });
@@ -1025,9 +1042,11 @@ export async function enrichAndGateCandidates(
           code: candidate.code,
           reason: llm.isPublicPromo ? 'invalid-code-or-vendor' : 'not-public-promo'
         });
+        await storeGateCache(context, inputHash, { outcome: 'rejected' });
         continue;
       }
       onEvent?.('llm_gate_accepted', { vendor: candidate.vendor, code: candidate.code, accepted: applied.length });
+      await storeGateCache(context, inputHash, { outcome: 'accepted', result: llm });
       enriched.push(...applied);
     } catch (error) {
       onEvent?.('llm_gate_failed', {
@@ -1038,4 +1057,12 @@ export async function enrichAndGateCandidates(
     }
   }
   return enriched;
+}
+
+async function storeGateCache(context: LlmCallContext | undefined, hash: string, hit: LlmCacheHit): Promise<void> {
+  try {
+    await context?.storeCache?.(hash, hit);
+  } catch {
+    // A cache write must not change the gate decision.
+  }
 }
