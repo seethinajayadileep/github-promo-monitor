@@ -13,10 +13,16 @@ import {
   extractPassOne,
   getLaneCursor,
   insertScanRun,
+  isFollowableRepo,
   latestBackfillWindow,
   latestEtag,
+  listFollowedRepos,
+  markFollowedRepoPolled,
   notifyAll,
+  rememberFollowedRepo,
+  syncFollowedRepos,
   upsertPromoCandidate,
+  type GitHubResponse,
   type PromoCandidate,
   type RateLimitState,
   type ScanMode,
@@ -92,6 +98,16 @@ async function ingestText(
   let newCodes = 0;
   for (const candidate of candidates) {
     const result = await upsertPromoCandidate(pool, candidate);
+    if (isFollowableRepo(candidate.repoFullName)) {
+      try {
+        await rememberFollowedRepo(pool, candidate.repoFullName, result.isNew || result.insertedSighting);
+      } catch (error) {
+        log('followed_repo_remember_failed', {
+          repoFullName: candidate.repoFullName,
+          error: error instanceof Error ? error.message : 'unknown'
+        });
+      }
+    }
     if (!result.isNew) continue;
     newCodes += 1;
     const alertable = mode === 'live' && (candidate.confidence === 'high' || candidate.confidence === 'medium');
@@ -183,6 +199,21 @@ function uniqueCommitItems(items: CommitSearchItem[]): CommitSearchItem[] {
   return unique;
 }
 
+async function fetchSearchPage<T>(
+  github: GitHubClient,
+  path: string,
+  requestOptions: { cacheKey?: string; accept?: string },
+  context: Record<string, unknown>
+): Promise<{ ok: true; response: GitHubResponse<SearchResponse<T>> } | { ok: false }> {
+  try {
+    const response = await github.request<SearchResponse<T>>(path, requestOptions);
+    return { ok: true, response };
+  } catch (error) {
+    log('search_page_failed', { ...context, error: error instanceof Error ? error.message : 'unknown' });
+    return { ok: false };
+  }
+}
+
 async function scanCommitSearch(
   options: PollerOptions,
   query: string,
@@ -194,7 +225,8 @@ async function scanCommitSearch(
   let pagesScanned = 0;
   let totalCount = 0;
   let complete = true;
-  let lastResponse: Awaited<ReturnType<GitHubClient['request']>> | undefined;
+  let lastResponse: GitHubResponse<SearchResponse<CommitSearchItem>> | undefined;
+  const minimumRateLimitPercent = mode === 'backfill' ? config.minimumRateLimitPercent : config.liveMinimumRateLimitPercent;
 
   for (let page = 1; page <= config.maxCommitSearchPages; page += 1) {
     const cacheKey = `search:commits:${queryKey}:${cursorWindow ?? 'latest'}:page1`;
@@ -203,10 +235,17 @@ async function scanCommitSearch(
       const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, `commits-${cursorWindow ?? 'latest'}`);
       if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
     }
-    const response = await options.github.request<SearchResponse<CommitSearchItem>>(
+    const fetched = await fetchSearchPage<CommitSearchItem>(
+      options.github,
       `/search/commits?q=${encodeQuery(query)}&sort=committer-date&order=desc&per_page=${config.searchPageSize}&page=${page}`,
-      useEtag ? { cacheKey, accept: 'application/vnd.github+json' } : { accept: 'application/vnd.github+json' }
+      useEtag ? { cacheKey, accept: 'application/vnd.github+json' } : { accept: 'application/vnd.github+json' },
+      { queryKey, surface: 'commits', page }
     );
+    if (!fetched.ok) {
+      complete = false;
+      break;
+    }
+    const response = fetched.response;
     lastResponse = response;
     pagesScanned += 1;
     const items = response.notModified ? [] : response.data?.items ?? [];
@@ -217,6 +256,8 @@ async function scanCommitSearch(
     if (totalCount > 0 && scannedCount >= Math.min(totalCount, 1000)) break;
     if (page === config.maxCommitSearchPages) {
       complete = totalCount > 0 ? scannedCount >= Math.min(totalCount, 1000) : false;
+    } else {
+      await options.github.paceIfNeeded(response.rateLimit, minimumRateLimitPercent);
     }
   }
 
@@ -233,7 +274,7 @@ async function scanCommitSearch(
     ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
   if (lastResponse) {
-    await options.github.paceIfNeeded(lastResponse.rateLimit, mode === 'backfill' ? config.minimumRateLimitPercent : config.liveMinimumRateLimitPercent);
+    await options.github.paceIfNeeded(lastResponse.rateLimit, minimumRateLimitPercent);
   }
   return {
     hitsFound: items.length,
@@ -245,16 +286,45 @@ async function scanCommitSearch(
   };
 }
 
+function uniqueIssueItems(items: IssueSearchItem[]): IssueSearchItem[] {
+  const seen = new Set<string>();
+  const unique: IssueSearchItem[] = [];
+  for (const item of items) {
+    if (!item.html_url || seen.has(item.html_url)) continue;
+    seen.add(item.html_url);
+    unique.push(item);
+  }
+  return unique;
+}
+
 async function scanIssueSearch(options: PollerOptions, query: string, queryKey: string, mode: ScanMode): Promise<IngestResult> {
   const cacheKey = `search:issues:${queryKey}`;
   const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, 'issues');
   if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
   const issueQuery = addIssueQualifier(query, 'issue');
-  const response = await options.github.request<SearchResponse<IssueSearchItem>>(
-    `/search/issues?q=${encodeQuery(issueQuery)}&sort=created&order=desc&per_page=${config.searchPageSize}`,
-    { cacheKey }
-  );
-  const items = response.notModified ? [] : response.data?.items ?? [];
+  const allItems: IssueSearchItem[] = [];
+  let lastResponse: GitHubResponse<SearchResponse<IssueSearchItem>> | undefined;
+
+  for (let page = 1; page <= config.maxIssueSearchPages; page += 1) {
+    const fetched = await fetchSearchPage<IssueSearchItem>(
+      options.github,
+      `/search/issues?q=${encodeQuery(issueQuery)}&sort=created&order=desc&per_page=${config.searchPageSize}&page=${page}`,
+      page === 1 ? { cacheKey } : {},
+      { queryKey, surface: 'issues', page }
+    );
+    if (!fetched.ok) break;
+    const response = fetched.response;
+    lastResponse = response;
+    const pageItems = response.notModified ? [] : response.data?.items ?? [];
+    allItems.push(...pageItems);
+    if (response.notModified || pageItems.length < config.searchPageSize) break;
+    if (uniqueIssueItems(allItems).length >= Math.min(response.data?.total_count ?? 1000, 1000)) break;
+    if (page < config.maxIssueSearchPages) {
+      await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
+    }
+  }
+
+  const items = uniqueIssueItems(allItems);
   let newCodes = 0;
   for (const item of items) {
     newCodes += await ingestText(options.pool, options.vendors, {
@@ -269,13 +339,13 @@ async function scanIssueSearch(options: PollerOptions, query: string, queryKey: 
     queryKey,
     surface: 'issues',
     mode,
-    etag: response.etag,
+    etag: lastResponse?.etag,
     hitsFound: items.length,
     newCodes,
-    ...rateLimitFields(response.rateLimit)
+    ...rateLimitFields(lastResponse?.rateLimit ?? {})
   });
-  await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
-  return { hitsFound: items.length, newCodes, rateLimitRemaining: response.rateLimit.remaining, etag: response.etag };
+  if (lastResponse) await options.github.paceIfNeeded(lastResponse.rateLimit, config.liveMinimumRateLimitPercent);
+  return { hitsFound: items.length, newCodes, rateLimitRemaining: lastResponse?.rateLimit.remaining, etag: lastResponse?.etag };
 }
 
 export async function scanSlowLane(options: PollerOptions): Promise<void> {
@@ -311,7 +381,7 @@ function uniqueCodeItems(items: CodeSearchItem[]): CodeSearchItem[] {
 async function scanCodeSearch(options: PollerOptions, query: string, queryKey: string): Promise<IngestResult> {
   const allItems: CodeSearchItem[] = [];
   let totalCount = 0;
-  let lastResponse: Awaited<ReturnType<GitHubClient['request']>> | undefined;
+  let lastResponse: GitHubResponse<SearchResponse<CodeSearchItem>> | undefined;
 
   for (let page = 1; page <= config.maxCodeSearchPages; page += 1) {
     const cacheKey = `search:code:${queryKey}`;
@@ -319,16 +389,23 @@ async function scanCodeSearch(options: PollerOptions, query: string, queryKey: s
       const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, queryKey, 'code');
       if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
     }
-    const response = await options.github.request<SearchResponse<CodeSearchItem>>(
+    const fetched = await fetchSearchPage<CodeSearchItem>(
+      options.github,
       `/search/code?q=${encodeQuery(query)}&sort=indexed&order=desc&per_page=${config.searchPageSize}&page=${page}`,
-      page === 1 ? { cacheKey, accept: 'application/vnd.github.text-match+json' } : { accept: 'application/vnd.github.text-match+json' }
+      page === 1 ? { cacheKey, accept: 'application/vnd.github.text-match+json' } : { accept: 'application/vnd.github.text-match+json' },
+      { queryKey, surface: 'code', page }
     );
+    if (!fetched.ok) break;
+    const response = fetched.response;
     lastResponse = response;
     const pageItems = response.notModified ? [] : response.data?.items ?? [];
     totalCount = response.data?.total_count ?? totalCount;
     allItems.push(...pageItems);
     if (response.notModified || pageItems.length < config.searchPageSize) break;
     if (totalCount > 0 && uniqueCodeItems(allItems).length >= Math.min(totalCount, 1000)) break;
+    if (page < config.maxCodeSearchPages) {
+      await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
+    }
   }
 
   const items = uniqueCodeItems(allItems);
@@ -373,44 +450,113 @@ async function fetchRepoFile(github: GitHubClient, repoFullName: string, filePat
   return Buffer.from(response.data.content.replace(/\n/g, ''), 'base64').toString('utf8');
 }
 
-export async function scanWatchlist(options: PollerOptions): Promise<void> {
-  for (const entry of options.watchlist) {
-    if (!/^[\w.-]+\/[\w.-]+$/.test(entry.repo)) continue;
-    const cacheKey = `watchlist:${entry.repo}`;
-    try {
-      const storedEtag = options.github.getEtag(cacheKey) ?? await latestEtag(options.pool, cacheKey, 'core-commits');
-      if (storedEtag && !options.github.getEtag(cacheKey)) options.github.setEtag(cacheKey, storedEtag);
-      const response = await options.github.request<RepoCommitListItem[]>(`/repos/${entry.repo}/commits?per_page=20`, { cacheKey });
-      const items = response.notModified ? [] : response.data ?? [];
-      let newCodes = 0;
-      for (const item of items) {
-        let text = item.commit?.message ?? '';
-        try {
-          const detail = await commitDetailText(options.github, entry.repo, item.sha);
-          text = detail.text;
-        } catch (error) {
-          log('watchlist_detail_failed', { repo: entry.repo, sha: item.sha, error: error instanceof Error ? error.message : 'unknown' });
-        }
-        newCodes += await ingestText(options.pool, options.vendors, {
-          text,
-          sourceUrl: item.html_url,
-          sourceType: 'watchlist',
-          repoFullName: entry.repo,
-          sourceDate: dateOrUndefined(item.commit?.committer?.date)
-        }, 'live');
+const STATIC_WATCHLIST_COMMIT_PAGE_SIZE = 20;
+
+interface RepoCommitPoll {
+  repo: string;
+  queryKey: string;
+  perPage: number;
+  maxDetails: number;
+  lane: 'watchlist' | 'followed';
+}
+
+async function pollRepoCommits(options: PollerOptions, poll: RepoCommitPoll): Promise<number> {
+  const storedEtag = options.github.getEtag(poll.queryKey) ?? await latestEtag(options.pool, poll.queryKey, 'core-commits');
+  if (storedEtag && !options.github.getEtag(poll.queryKey)) options.github.setEtag(poll.queryKey, storedEtag);
+  const response = await options.github.request<RepoCommitListItem[]>(
+    `/repos/${poll.repo}/commits?per_page=${poll.perPage}`,
+    { cacheKey: poll.queryKey }
+  );
+  const items = response.notModified ? [] : response.data ?? [];
+  let newCodes = 0;
+  let detailsFetched = 0;
+  for (const item of items) {
+    let text = item.commit?.message ?? '';
+    if (detailsFetched < poll.maxDetails && item.sha) {
+      detailsFetched += 1;
+      try {
+        const detail = await commitDetailText(options.github, poll.repo, item.sha);
+        text = detail.text;
+      } catch (error) {
+        log('repo_commit_detail_failed', {
+          lane: poll.lane,
+          repo: poll.repo,
+          sha: item.sha,
+          error: error instanceof Error ? error.message : 'unknown'
+        });
       }
-      await insertScanRun(options.pool, {
-        queryKey: cacheKey,
-        surface: 'core-commits',
-        mode: 'live',
-        etag: response.etag,
-        hitsFound: items.length,
-        newCodes,
-        ...rateLimitFields(response.rateLimit)
+    }
+    newCodes += await ingestText(options.pool, options.vendors, {
+      text,
+      sourceUrl: item.html_url,
+      sourceType: 'watchlist',
+      repoFullName: poll.repo,
+      sourceDate: dateOrUndefined(item.commit?.committer?.date)
+    }, 'live');
+  }
+  await insertScanRun(options.pool, {
+    queryKey: poll.queryKey,
+    surface: 'core-commits',
+    mode: 'live',
+    etag: response.etag,
+    hitsFound: items.length,
+    newCodes,
+    ...rateLimitFields(response.rateLimit)
+  });
+  await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
+  return detailsFetched;
+}
+
+export async function scanWatchlist(options: PollerOptions): Promise<void> {
+  try {
+    await syncFollowedRepos(options.pool);
+  } catch (error) {
+    log('followed_repo_sync_failed', { error: error instanceof Error ? error.message : 'unknown' });
+  }
+
+  const staticRepos = options.watchlist.map((entry) => entry.repo).filter((repo) => isFollowableRepo(repo));
+  for (const repo of staticRepos) {
+    try {
+      await pollRepoCommits(options, {
+        repo,
+        queryKey: `watchlist:${repo}`,
+        perPage: STATIC_WATCHLIST_COMMIT_PAGE_SIZE,
+        maxDetails: STATIC_WATCHLIST_COMMIT_PAGE_SIZE,
+        lane: 'watchlist'
       });
-      await options.github.paceIfNeeded(response.rateLimit, config.liveMinimumRateLimitPercent);
     } catch (error) {
-      log('watchlist_scan_failed', { repo: entry.repo, error: error instanceof Error ? error.message : 'unknown' });
+      log('watchlist_scan_failed', { repo, error: error instanceof Error ? error.message : 'unknown' });
+    }
+  }
+
+  let followed: string[] = [];
+  try {
+    followed = await listFollowedRepos(options.pool, config.maxFollowedReposPerScan, staticRepos);
+  } catch (error) {
+    log('followed_repo_list_failed', { error: error instanceof Error ? error.message : 'unknown' });
+    return;
+  }
+
+  let detailsBudget = config.maxFollowedCommitDetailsPerScan;
+  for (const repo of followed) {
+    const maxDetails = Math.min(config.maxFollowedCommitDetailsPerRepo, detailsBudget);
+    try {
+      const used = await pollRepoCommits(options, {
+        repo,
+        queryKey: `followed:${repo}`,
+        perPage: config.followedRepoCommitPageSize,
+        maxDetails,
+        lane: 'followed'
+      });
+      detailsBudget = Math.max(0, detailsBudget - used);
+    } catch (error) {
+      log('followed_repo_scan_failed', { repo, error: error instanceof Error ? error.message : 'unknown' });
+    } finally {
+      try {
+        await markFollowedRepoPolled(options.pool, repo);
+      } catch (error) {
+        log('followed_repo_mark_failed', { repo, error: error instanceof Error ? error.message : 'unknown' });
+      }
     }
   }
 }

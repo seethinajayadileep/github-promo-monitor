@@ -46,7 +46,12 @@ async function main(): Promise<void> {
     fastLaneIntervalMs: config.fastLaneIntervalMs,
     slowLaneIntervalMs: config.slowLaneIntervalMs,
     tokenCount: github.tokenPool.size,
-    llmProvider: configuredLlmProvider()
+    llmProvider: configuredLlmProvider(),
+    searchPageSize: config.searchPageSize,
+    maxCommitSearchPages: config.maxCommitSearchPages,
+    maxIssueSearchPages: config.maxIssueSearchPages,
+    maxCodeSearchPages: config.maxCodeSearchPages,
+    liveCommitWindowDays: config.liveCommitWindowDays
   });
 
   const dailyExpiry = async () => {

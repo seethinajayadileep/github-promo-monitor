@@ -111,6 +111,56 @@ export async function getLaneCursor(pool: pg.Pool, lane: string): Promise<number
   return Math.max(0, Number(result.rows[0]?.next_index ?? 0));
 }
 
+const FOLLOWABLE_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+export function isFollowableRepo(repo: string | undefined | null): repo is string {
+  return Boolean(repo && repo !== 'unknown/unknown' && FOLLOWABLE_REPO.test(repo));
+}
+
+export async function rememberFollowedRepo(pool: pg.Pool, repoFullName: string, countNewSighting: boolean): Promise<void> {
+  if (!isFollowableRepo(repoFullName)) return;
+  await pool.query(
+    `INSERT INTO followed_repos (repo_full_name, promo_count, last_seen_at)
+     VALUES ($1, 1, now())
+     ON CONFLICT (repo_full_name) DO UPDATE
+     SET last_seen_at = now(),
+         promo_count = followed_repos.promo_count + CASE WHEN $2::boolean THEN 1 ELSE 0 END`,
+    [repoFullName, countNewSighting]
+  );
+}
+
+export async function syncFollowedRepos(pool: pg.Pool): Promise<number> {
+  const result = await pool.query(
+    `INSERT INTO followed_repos (repo_full_name, promo_count, first_seen_at, last_seen_at)
+     SELECT repo_full_name, COUNT(*)::int, MIN(first_seen_at), MAX(last_seen_at)
+     FROM promo_codes
+     WHERE status <> 'flagged'
+       AND repo_full_name ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+     GROUP BY repo_full_name
+     ON CONFLICT (repo_full_name) DO UPDATE
+     SET promo_count = GREATEST(followed_repos.promo_count, EXCLUDED.promo_count),
+         last_seen_at = GREATEST(followed_repos.last_seen_at, EXCLUDED.last_seen_at)`
+  );
+  return result.rowCount ?? 0;
+}
+
+export async function listFollowedRepos(pool: pg.Pool, limit: number, exclude: string[] = []): Promise<string[]> {
+  const result = await pool.query<{ repo_full_name: string }>(
+    `SELECT repo_full_name
+     FROM followed_repos
+     WHERE NOT (repo_full_name = ANY($2::text[]))
+     ORDER BY last_polled_at ASC NULLS FIRST, last_seen_at DESC
+     LIMIT $1`,
+    [Math.max(1, Math.floor(limit)), exclude]
+  );
+  return result.rows.map((row) => row.repo_full_name).filter((repo) => isFollowableRepo(repo));
+}
+
+export async function markFollowedRepoPolled(pool: pg.Pool, repoFullName: string): Promise<void> {
+  if (!isFollowableRepo(repoFullName)) return;
+  await pool.query('UPDATE followed_repos SET last_polled_at = now() WHERE repo_full_name = $1', [repoFullName]);
+}
+
 export async function advanceLaneCursor(pool: pg.Pool, lane: string, nextIndex: number): Promise<void> {
   await pool.query(
     `INSERT INTO scan_lane_cursors (lane, next_index, updated_at)

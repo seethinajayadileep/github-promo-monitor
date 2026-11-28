@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { VendorConfig } from '@promo/shared';
+import { config } from '../src/config.js';
 import { scanFastLane, scanHistoricalBackfill, scanSlowLane, scanWatchlist } from '../src/poller.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -13,7 +14,7 @@ interface QueryCall {
   params?: unknown[];
 }
 
-function createFakePool(cursorIndex: number) {
+function createFakePool(cursorIndex: number, followed: string[] = []) {
   const queries: QueryCall[] = [];
   const pool = {
     query: async (sql: string, params?: unknown[]) => {
@@ -23,8 +24,28 @@ function createFakePool(cursorIndex: number) {
       if (sql.includes('SELECT etag FROM scan_runs')) return { rows: [], rowCount: 0 };
       if (sql.includes('INSERT INTO scan_runs')) return { rows: [], rowCount: 1 };
       if (sql.includes('SELECT cursor_window FROM scan_runs')) return { rows: [], rowCount: 0 };
+      if (sql.includes('FROM promo_codes') && sql.includes('followed_repos')) return { rows: [], rowCount: 0 };
+      if (sql.includes('FROM followed_repos')) {
+        const exclude = Array.isArray(params?.[1]) ? params[1] as string[] : [];
+        const rows = followed
+          .filter((repo) => !exclude.includes(repo))
+          .map((repoFullName) => ({ repo_full_name: repoFullName }));
+        return { rows, rowCount: rows.length };
+      }
+      if (sql.includes('UPDATE followed_repos') || sql.includes('INSERT INTO followed_repos')) return { rows: [], rowCount: 1 };
       return { rows: [], rowCount: 0 };
-    }
+    },
+    connect: async () => ({
+      query: async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params });
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+        if (sql.includes('INSERT INTO promo_codes')) return { rows: [{ id: 1, inserted: true }] };
+        if (sql.includes('INSERT INTO promo_sightings')) return { rowCount: 1 };
+        if (sql.includes('UPDATE promo_codes')) return { rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      },
+      release: () => undefined
+    })
   };
   return { pool, queries };
 }
@@ -73,7 +94,8 @@ describe('worker polling lanes', () => {
     const github = createGitHub((path) => {
       if (path.startsWith('/search/commits')) {
         const page = Number(new URL(`https://api.github.com${path}`).searchParams.get('page'));
-        return { data: { total_count: 32, items: commitItems(page === 1 ? 30 : 2, page === 1 ? 0 : 30) } };
+        const pageSize = config.searchPageSize;
+        return { data: { total_count: pageSize + 2, items: commitItems(page === 1 ? pageSize : 2, page === 1 ? 0 : pageSize) } };
       }
       if (path.startsWith('/search/issues')) return { data: { total_count: 0, items: [] } };
       return { data: {} };
@@ -87,10 +109,12 @@ describe('worker polling lanes', () => {
     expect(commitRequests[0]).toContain('page=1');
     expect(commitRequests[1]).toContain('page=2');
     expect(github.requests.some((path) => path.startsWith('/search/issues'))).toBe(true);
-    expect(github.requests.filter((path) => path.startsWith('/repos/acme/repo/commits/sha-'))).toHaveLength(30);
+    expect(github.requests.filter((path) => path.startsWith('/repos/acme/repo/commits/sha-'))).toHaveLength(
+      Math.min(config.searchPageSize + 2, config.maxCommitDetailsPerScan)
+    );
 
     const commitRun = queries.find(({ sql, params }) => sql.includes('INSERT INTO scan_runs') && params?.[0] === 'fast:8' && String(params[1]).startsWith('commits-'));
-    expect(commitRun?.params?.[5]).toBe(32);
+    expect(commitRun?.params?.[5]).toBe(config.searchPageSize + 2);
     const cursorWrite = queries.find(({ sql }) => sql.includes('INSERT INTO scan_lane_cursors'));
     expect(cursorWrite?.params).toEqual(['fast', 9]);
   });
@@ -100,11 +124,12 @@ describe('worker polling lanes', () => {
     const github = createGitHub((path) => {
       if (path.startsWith('/search/code')) {
         const page = Number(new URL(`https://api.github.com${path}`).searchParams.get('page'));
-        const count = page === 1 ? 30 : 1;
-        const offset = page === 1 ? 0 : 30;
+        const pageSize = config.searchPageSize;
+        const count = page === 1 ? pageSize : 1;
+        const offset = page === 1 ? 0 : pageSize;
         return {
           data: {
-            total_count: 31,
+            total_count: config.searchPageSize + 1,
             items: Array.from({ length: count }, (_, index) => ({
               html_url: `https://github.com/acme/repo/blob/main/README.md#L${offset + index}`,
               path: 'README.md',
@@ -128,10 +153,12 @@ describe('worker polling lanes', () => {
     expect(codeRequests[0]).toContain('page=1');
     expect(codeRequests[1]).toContain('page=2');
     expect(github.requests.some((path) => path.includes('README.md?ref=indexedsha0'))).toBe(true);
-    expect(github.requests.filter((path) => path.startsWith('/repos/acme/repo/contents/README.md'))).toHaveLength(8);
+    expect(github.requests.filter((path) => path.startsWith('/repos/acme/repo/contents/README.md'))).toHaveLength(
+      Math.min(config.searchPageSize + 1, config.maxCodeFilesPerScan)
+    );
 
     const codeRun = queries.find(({ sql, params }) => sql.includes('INSERT INTO scan_runs') && params?.[0] === 'slow:125');
-    expect(codeRun?.params?.[5]).toBe(31);
+    expect(codeRun?.params?.[5]).toBe(config.searchPageSize + 1);
     const cursorWrite = queries.find(({ sql }) => sql.includes('INSERT INTO scan_lane_cursors'));
     expect(cursorWrite?.params).toEqual(['slow', 126]);
   });
@@ -163,7 +190,7 @@ describe('worker polling lanes', () => {
   it('does not mark a backfill window complete when capped commit pages leave results unscanned', async () => {
     const { pool, queries } = createFakePool(0);
     const github = createGitHub((path) => {
-      if (path.startsWith('/search/commits')) return { data: { total_count: 1000, items: commitItems(30) } };
+      if (path.startsWith('/search/commits')) return { data: { total_count: 1000, items: commitItems(config.searchPageSize) } };
       return { data: {} };
     });
     const oneVendor: VendorConfig[] = [{ id: 'openai', name: 'OpenAI', category: 'ai', domains: ['openai.com'], keywords: ['OpenAI'] }];
@@ -178,5 +205,118 @@ describe('worker polling lanes', () => {
       .map((path, index) => ({ path, options: github.requestOptions[index] as { cacheKey?: string } | undefined }))
       .filter(({ path }) => path.startsWith('/search/commits'));
     expect(commitRequestOptions.every(({ options }) => options?.cacheKey === undefined)).toBe(true);
+  });
+
+  it('paginates issue search until a short page and stores every fetched hit', async () => {
+    const { pool, queries } = createFakePool(0);
+    const pageSize = config.searchPageSize;
+    const github = createGitHub((path) => {
+      if (path.startsWith('/search/commits')) return { data: { total_count: 0, items: [] } };
+      if (path.startsWith('/search/issues')) {
+        const page = Number(new URL(`https://api.github.com${path}`).searchParams.get('page'));
+        const count = page === 1 ? pageSize : 3;
+        const offset = page === 1 ? 0 : pageSize;
+        return {
+          data: {
+            total_count: pageSize + 3,
+            items: Array.from({ length: count }, (_, index) => ({
+              html_url: `https://github.com/acme/repo/issues/${offset + index}`,
+              title: 'ordinary question',
+              body: 'no promo here',
+              repository_url: 'https://api.github.com/repos/acme/repo'
+            }))
+          }
+        };
+      }
+      return { data: {} };
+    });
+
+    await scanFastLane({ pool: pool as never, github: github as never, vendors: liveVendors, watchlist: [] });
+
+    const issueRequests = github.requests.filter((path) => path.startsWith('/search/issues'));
+    expect(issueRequests).toHaveLength(2);
+    expect(issueRequests[0]).toContain('page=1');
+    expect(issueRequests[1]).toContain('page=2');
+    expect(issueRequests[0]).toContain(`per_page=${pageSize}`);
+    const issueRun = queries.find(({ sql, params }) => sql.includes('INSERT INTO scan_runs') && params?.[1] === 'issues');
+    expect(issueRun?.params?.[5]).toBe(pageSize + 3);
+  });
+
+  it('keeps code hits already fetched when a later page is rate limited', async () => {
+    const { pool, queries } = createFakePool(0);
+    const github = createGitHub((path) => {
+      if (path.startsWith('/search/code')) {
+        const page = Number(new URL(`https://api.github.com${path}`).searchParams.get('page'));
+        if (page > 1) throw new Error('GitHub request failed: 429 Too many requests');
+        return {
+          data: {
+            total_count: 1000,
+            items: Array.from({ length: config.searchPageSize }, (_, index) => ({
+              html_url: `https://github.com/acme/repo/blob/main/README.md#L${index}`,
+              path: 'README.md',
+              sha: `limitedsha${index}`,
+              repository: { full_name: 'acme/repo' },
+              text_matches: [{ fragment: 'ordinary documentation' }]
+            }))
+          }
+        };
+      }
+      if (path.startsWith('/repos/acme/repo/contents/')) {
+        return { data: { content: Buffer.from('ordinary documentation').toString('base64'), encoding: 'base64' } };
+      }
+      return { data: {} };
+    });
+
+    await scanSlowLane({ pool: pool as never, github: github as never, vendors: liveVendors, watchlist: [] });
+
+    expect(github.requests.filter((path) => path.startsWith('/search/code'))).toHaveLength(2);
+    expect(github.requests.filter((path) => path.startsWith('/repos/acme/repo/contents/'))).toHaveLength(config.maxCodeFilesPerScan);
+    const codeRun = queries.find(({ sql, params }) => sql.includes('INSERT INTO scan_runs') && params?.[1] === 'code');
+    expect(codeRun?.params?.[5]).toBe(config.searchPageSize);
+  });
+
+  it('polls repos that already yielded promos and stores a later public code from a new push', async () => {
+    const { pool, queries } = createFakePool(0, ['acme/repo', 'acme/promo-notes']);
+    const github = createGitHub((path) => {
+      if (path.startsWith('/repos/acme/repo/commits?')) return { data: [] };
+      if (path.startsWith('/repos/acme/promo-notes/commits?')) {
+        return {
+          data: [{
+            sha: 'newsha',
+            html_url: 'https://github.com/acme/promo-notes/commit/newsha',
+            commit: {
+              message: 'Use promo code HACK2026 for OpenAI credits https://platform.openai.com',
+              committer: { date: '2026-11-28T00:00:00Z' }
+            }
+          }]
+        };
+      }
+      if (path.startsWith('/repos/acme/promo-notes/commits/newsha')) {
+        return {
+          data: {
+            commit: { message: 'Use promo code HACK2026 for OpenAI credits https://platform.openai.com' },
+            files: [{ filename: 'README.md', patch: 'Use promo code HACK2026 for OpenAI credits at https://platform.openai.com' }]
+          }
+        };
+      }
+      return { data: {} };
+    });
+
+    await scanWatchlist({
+      pool: pool as never,
+      github: github as never,
+      vendors: liveVendors,
+      watchlist: [{ repo: 'acme/repo' }]
+    });
+
+    const lists = github.requests.filter((path) => path.includes('/commits?'));
+    expect(lists.filter((path) => path.includes('/repos/acme/repo/commits?'))).toHaveLength(1);
+    expect(lists.find((path) => path.includes('/repos/acme/repo/'))).toContain('per_page=20');
+    expect(lists.some((path) => path.includes(`/repos/acme/promo-notes/commits?per_page=${config.followedRepoCommitPageSize}`))).toBe(true);
+    const listQuery = queries.find(({ sql }) => sql.includes('FROM followed_repos') && sql.includes('SELECT repo_full_name'));
+    expect(listQuery?.params?.[1]).toEqual(['acme/repo']);
+    expect(queries.some(({ sql, params }) => sql.includes('INSERT INTO promo_codes') && params?.includes('HACK2026'))).toBe(true);
+    expect(queries.some(({ sql, params }) => sql.includes('INSERT INTO followed_repos') && !sql.includes('SELECT') && params?.[0] === 'acme/promo-notes')).toBe(true);
+    expect(queries.filter(({ sql }) => sql.includes('UPDATE followed_repos')).map(({ params }) => params?.[0])).toEqual(['acme/promo-notes']);
   });
 });
