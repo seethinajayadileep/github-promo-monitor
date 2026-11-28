@@ -1,4 +1,5 @@
 import { canonicalCode } from './dedupe.js';
+import { buildLlmUsageRecord, parseProviderUsage, type LlmCallContext } from './llmUsage.js';
 import { rejectSecrets } from './secrets.js';
 import { isCryptoOrSpam } from './spam.js';
 import { sanitizeRedeemUrl } from './urls.js';
@@ -497,6 +498,23 @@ export function configuredLlmProvider(env: NodeJS.ProcessEnv = process.env): Llm
   return 'none';
 }
 
+export function configuredLlmModel(env: NodeJS.ProcessEnv = process.env): string {
+  const provider = configuredLlmProvider(env);
+  if (provider === 'openai') return env.OPENAI_MODEL || OPENAI_DEFAULT_MODEL;
+  if (provider === 'sarvam') return env.SARVAM_MODEL || SARVAM_DEFAULT_MODEL;
+  if (provider === 'gemini') return env.GEMINI_MODEL || 'gemini-1.5-flash';
+  return 'none';
+}
+
+async function emitLlmCall(context: LlmCallContext | undefined, record: ReturnType<typeof buildLlmUsageRecord>): Promise<void> {
+  if (!context?.onCall) return;
+  try {
+    await context.onCall(record);
+  } catch {
+    // Usage persistence must not change the gate decision.
+  }
+}
+
 export interface SarvamChatRequest {
   url: string;
   headers: Record<string, string>;
@@ -628,12 +646,14 @@ async function responseErrorSnippet(response: Response): Promise<string> {
   }
 }
 
-async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
+async function callSarvamDetailed(prompt: string, context?: LlmCallContext): Promise<LlmCallOutcome> {
   const apiKey = process.env.SARVAM_API_KEY;
   if (!apiKey) return { content: null, failureReason: 'missing-api-key' };
   const request = buildSarvamChatRequest(prompt);
+  const model = request.body.model;
   let lastReason = 'unknown';
   for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const attemptNumber = attempt + 1;
     try {
       const response = await fetch(request.url, {
         method: 'POST',
@@ -644,6 +664,9 @@ async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
       if (!response.ok) {
         const snippet = await responseErrorSnippet(response);
         lastReason = `http-${response.status}${snippet ? `: ${snippet}` : ''}`;
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'sarvam', model, attempt: attemptNumber, status: 'error', failureReason: lastReason
+        }));
         if (attempt < 2 && transientHttpStatus(response.status)) {
           await delay(retryDelayMs(attempt));
           continue;
@@ -655,22 +678,32 @@ async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
         body = await response.json() as typeof body;
       } catch {
         lastReason = 'invalid-json-response';
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'sarvam', model, attempt: attemptNumber, status: 'error', failureReason: lastReason
+        }));
         if (attempt < 2) {
           await delay(retryDelayMs(attempt));
           continue;
         }
         return { content: null, failureReason: lastReason };
       }
+      const usage = parseProviderUsage(body);
       const choice = body.choices?.[0];
       const content = choice?.message?.content ?? '';
-      const finishReason = choice?.finish_reason;
+      const finishReason = choice?.finish_reason ?? usage.finishReason;
       if (finishReason === 'length') {
         lastReason = content.trim() ? 'finish-length-truncated-output' : 'finish-length-empty-content';
       } else if (!content.trim()) {
         lastReason = finishReason ? `empty-content-finish-${finishReason}` : 'empty-content-no-finish-reason';
       } else {
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'sarvam', model, attempt: attemptNumber, status: 'success', finishReason, usage
+        }));
         return { content };
       }
+      await emitLlmCall(context, buildLlmUsageRecord({
+        provider: 'sarvam', model, attempt: attemptNumber, status: 'error', failureReason: lastReason, finishReason, usage
+      }));
       if (attempt < 2) {
         await delay(retryDelayMs(attempt));
         continue;
@@ -682,6 +715,9 @@ async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
       lastReason = name === 'TimeoutError' || name === 'AbortError' || /timed out|timeout/i.test(message)
         ? `timeout: ${message}`
         : `network-error: ${message}`;
+      await emitLlmCall(context, buildLlmUsageRecord({
+        provider: 'sarvam', model, attempt: attemptNumber, status: 'error', failureReason: lastReason
+      }));
       if (attempt < 2) {
         await delay(retryDelayMs(attempt));
         continue;
@@ -692,13 +728,15 @@ async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
   return { content: null, failureReason: lastReason };
 }
 
-async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
+async function callOpenAiDetailed(prompt: string, context?: LlmCallContext): Promise<LlmCallOutcome> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return { content: null, failureReason: 'missing-api-key' };
   let maxTokens = positiveIntEnv(process.env, 'OPENAI_MAX_COMPLETION_TOKENS', OPENAI_DEFAULT_MAX_COMPLETION_TOKENS);
   let lastReason = 'unknown';
   for (let attempt = 0; attempt <= 2; attempt += 1) {
     const request = buildOpenAiChatRequest(prompt, process.env, maxTokens);
+    const model = request.body.model;
+    const attemptNumber = attempt + 1;
     try {
       const response = await fetch(request.url, {
         method: 'POST',
@@ -709,6 +747,9 @@ async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
       if (!response.ok) {
         const snippet = await responseErrorSnippet(response);
         lastReason = `http-${response.status}${snippet ? `: ${snippet}` : ''}`;
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'openai', model, attempt: attemptNumber, status: 'error', failureReason: lastReason
+        }));
         if (attempt < 2 && transientHttpStatus(response.status)) {
           await delay(retryDelayMs(attempt));
           continue;
@@ -725,19 +766,39 @@ async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
         body = await response.json() as typeof body;
       } catch {
         lastReason = 'invalid-json-response';
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'openai', model, attempt: attemptNumber, status: 'error', failureReason: lastReason
+        }));
         if (attempt < 2) {
           await delay(retryDelayMs(attempt));
           continue;
         }
         return { content: null, failureReason: lastReason };
       }
+      const usage = parseProviderUsage(body);
       const choice = body.choices?.[0];
-      const finishReason = choice?.finish_reason;
+      const finishReason = choice?.finish_reason ?? usage.finishReason;
       const refusal = choice?.message?.refusal?.trim() ?? '';
       const content = choice?.message?.content ?? '';
-      if (refusal && !content.trim()) return { content: null, failureReason: `refusal: ${refusal.slice(0, 240)}` };
-      if (finishReason === 'content_filter') return { content: null, failureReason: 'content-filter' };
-      if (content.trim() && parseLlmJson(content)) return { content };
+      if (refusal && !content.trim()) {
+        lastReason = `refusal: ${refusal.slice(0, 240)}`;
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'openai', model, attempt: attemptNumber, status: 'error', failureReason: lastReason, finishReason, usage
+        }));
+        return { content: null, failureReason: lastReason };
+      }
+      if (finishReason === 'content_filter') {
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'openai', model, attempt: attemptNumber, status: 'error', failureReason: 'content-filter', finishReason, usage
+        }));
+        return { content: null, failureReason: 'content-filter' };
+      }
+      if (content.trim() && parseLlmJson(content)) {
+        await emitLlmCall(context, buildLlmUsageRecord({
+          provider: 'openai', model, attempt: attemptNumber, status: 'success', finishReason, usage
+        }));
+        return { content };
+      }
       if (finishReason === 'length') {
         lastReason = content.trim() ? 'finish-length-truncated-output' : 'finish-length-empty-content';
         maxTokens = nextOpenAiTokenBudget(request.body.max_completion_tokens);
@@ -746,6 +807,9 @@ async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
       } else {
         lastReason = 'unparseable-json-response';
       }
+      await emitLlmCall(context, buildLlmUsageRecord({
+        provider: 'openai', model, attempt: attemptNumber, status: 'error', failureReason: lastReason, finishReason, usage
+      }));
       if (attempt < 2) {
         await delay(retryDelayMs(attempt));
         continue;
@@ -757,6 +821,9 @@ async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
       lastReason = name === 'TimeoutError' || name === 'AbortError' || /timed out|timeout/i.test(message)
         ? `timeout: ${message}`
         : `network-error: ${message}`;
+      await emitLlmCall(context, buildLlmUsageRecord({
+        provider: 'openai', model, attempt: attemptNumber, status: 'error', failureReason: lastReason
+      }));
       if (attempt < 2) {
         await delay(retryDelayMs(attempt));
         continue;
@@ -767,22 +834,51 @@ async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
   return { content: null, failureReason: lastReason };
 }
 
-async function callGemini(prompt: string): Promise<string | null> {
+async function callGemini(prompt: string, context?: LlmCallContext): Promise<LlmCallOutcome> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) return { content: null, failureReason: 'missing-api-key' };
   const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      generationConfig: { temperature: 0, responseMimeType: 'application/json' },
-      contents: [{ role: 'user', parts: [{ text: prompt }] }]
-    }),
-    signal: AbortSignal.timeout(20_000)
-  });
-  if (!response.ok) return null;
-  const body = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  return body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('') || null;
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        generationConfig: { temperature: 0, responseMimeType: 'application/json' },
+        contents: [{ role: 'user', parts: [{ text: prompt }] }]
+      }),
+      signal: AbortSignal.timeout(20_000)
+    });
+    if (!response.ok) {
+      const failureReason = `http-${response.status}`;
+      await emitLlmCall(context, buildLlmUsageRecord({
+        provider: 'gemini', model, attempt: 1, status: 'error', failureReason
+      }));
+      return { content: null, failureReason };
+    }
+    const body = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const usage = parseProviderUsage(body);
+    const content = body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('') || '';
+    if (!content.trim()) {
+      await emitLlmCall(context, buildLlmUsageRecord({
+        provider: 'gemini', model, attempt: 1, status: 'error', failureReason: 'gemini-empty-or-error', usage
+      }));
+      return { content: null, failureReason: 'gemini-empty-or-error' };
+    }
+    await emitLlmCall(context, buildLlmUsageRecord({
+      provider: 'gemini', model, attempt: 1, status: 'success', finishReason: usage.finishReason, usage
+    }));
+    return { content };
+  } catch (error) {
+    const name = error instanceof Error ? error.name : '';
+    const message = error instanceof Error ? error.message : 'unknown';
+    const failureReason = name === 'TimeoutError' || name === 'AbortError' || /timed out|timeout/i.test(message)
+      ? `timeout: ${message}`
+      : `network-error: ${message}`;
+    await emitLlmCall(context, buildLlmUsageRecord({
+      provider: 'gemini', model, attempt: 1, status: 'error', failureReason
+    }));
+    return { content: null, failureReason };
+  }
 }
 
 export interface LlmExtractionOutcome {
@@ -791,14 +887,18 @@ export interface LlmExtractionOutcome {
 }
 
 /** Stage 3 pass 2 with provider failure detail for gate logging. */
-export async function extractWithLlmDetailed(text: string, vendors: VendorConfig[]): Promise<LlmExtractionOutcome> {
+export async function extractWithLlmDetailed(
+  text: string,
+  vendors: VendorConfig[],
+  context?: LlmCallContext
+): Promise<LlmExtractionOutcome> {
   const provider = configuredLlmProvider();
   if (provider === 'none') return { result: null, failureReason: 'unconfigured' };
   if (rejectSecrets(text).rejected) return { result: null, failureReason: 'rejected-secret-input' };
   if (isCryptoOrSpam({ text, vendors })) return { result: null, failureReason: 'rejected-crypto-or-spam-input' };
   const prompt = llmPrompt(text, vendors);
   if (provider === 'sarvam') {
-    const outcome = await callSarvamDetailed(prompt);
+    const outcome = await callSarvamDetailed(prompt, context);
     if (!outcome.content) return { result: null, failureReason: outcome.failureReason ?? 'empty-response' };
     const parsed = parseLlmJson(outcome.content);
     return parsed
@@ -806,16 +906,16 @@ export async function extractWithLlmDetailed(text: string, vendors: VendorConfig
       : { result: null, failureReason: 'unparseable-json-response' };
   }
   if (provider === 'openai') {
-    const outcome = await callOpenAiDetailed(prompt);
+    const outcome = await callOpenAiDetailed(prompt, context);
     if (!outcome.content) return { result: null, failureReason: outcome.failureReason ?? 'empty-response' };
     const parsed = parseLlmJson(outcome.content);
     return parsed
       ? { result: parsed }
       : { result: null, failureReason: 'unparseable-json-response' };
   }
-  const raw = await callGemini(prompt);
-  if (!raw) return { result: null, failureReason: 'gemini-empty-or-error' };
-  const parsed = parseLlmJson(raw);
+  const outcome = await callGemini(prompt, context);
+  if (!outcome.content) return { result: null, failureReason: outcome.failureReason ?? 'gemini-empty-or-error' };
+  const parsed = parseLlmJson(outcome.content);
   return parsed ? { result: parsed } : { result: null, failureReason: 'gemini-unparseable-json-response' };
 }
 
@@ -905,13 +1005,14 @@ export interface LlmGateEvent {
 export async function enrichAndGateCandidates(
   candidates: PromoCandidate[],
   vendors: VendorConfig[],
-  onEvent?: (event: string, details: Record<string, unknown>) => void
+  onEvent?: (event: string, details: Record<string, unknown>) => void,
+  context?: LlmCallContext
 ): Promise<PromoCandidate[]> {
   if (configuredLlmProvider() === 'none') return candidates;
   const enriched: PromoCandidate[] = [];
   for (const candidate of candidates) {
     try {
-      const outcome = await extractWithLlmDetailed(candidate.llmContext ?? candidate.snippet, vendors);
+      const outcome = await extractWithLlmDetailed(candidate.llmContext ?? candidate.snippet, vendors, context);
       const llm = outcome.result;
       if (!llm) {
         onEvent?.('llm_gate_failed', { vendor: candidate.vendor, code: candidate.code, reason: outcome.failureReason ?? 'unknown' });
@@ -919,9 +1020,14 @@ export async function enrichAndGateCandidates(
       }
       const applied = expandLlmCandidates(candidate, llm, vendors);
       if (!applied.length) {
-        onEvent?.('llm_gate_rejected', { vendor: candidate.vendor, code: candidate.code });
+        onEvent?.('llm_gate_rejected', {
+          vendor: candidate.vendor,
+          code: candidate.code,
+          reason: llm.isPublicPromo ? 'invalid-code-or-vendor' : 'not-public-promo'
+        });
         continue;
       }
+      onEvent?.('llm_gate_accepted', { vendor: candidate.vendor, code: candidate.code, accepted: applied.length });
       enriched.push(...applied);
     } catch (error) {
       onEvent?.('llm_gate_failed', {

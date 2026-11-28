@@ -273,6 +273,10 @@ describe('worker polling lanes', () => {
     expect(github.requests.filter((path) => path.startsWith('/repos/acme/repo/contents/'))).toHaveLength(config.maxCodeFilesPerScan);
     const codeRun = queries.find(({ sql, params }) => sql.includes('INSERT INTO scan_runs') && params?.[1] === 'code');
     expect(codeRun?.params?.[5]).toBe(config.searchPageSize);
+    expect(codeRun?.params?.[10]).toBe(1);
+    expect(codeRun?.params?.[12]).toBe(false);
+    expect(codeRun?.params?.[13]).toBe(true);
+    expect(codeRun?.params?.[15]).toBe('slow');
   });
 
   it('polls repos that already yielded promos and stores a later public code from a new push', async () => {

@@ -33,4 +33,18 @@ describe('dashboard query parsing and pagination', () => {
     expect(source).toContain('setStatus(currentStatus)');
     expect(source).toContain('[currentStatus]');
   });
+
+  it('links to the stats page and keeps secrets out of the stats view', () => {
+    const source = fs.readFileSync(path.join(dashboardRoot, 'components/StatsDashboard.tsx'), 'utf8');
+    const layout = fs.readFileSync(path.join(dashboardRoot, 'components/Nav.tsx'), 'utf8');
+    const page = fs.readFileSync(path.join(dashboardRoot, 'app/stats/page.tsx'), 'utf8');
+    expect(layout).toContain('href="/stats"');
+    expect(fs.readFileSync(path.join(dashboardRoot, 'app/layout.tsx'), 'utf8')).toContain('<Nav />');
+    expect(page).toContain('loadDashboardStats');
+    expect(source).toContain('STATS_HONESTY');
+    expect(source).toContain('Exa discovery');
+    expect(source).toContain('Asia/Kolkata');
+    expect(source).not.toContain('EXA_API_KEY');
+    expect(source).not.toContain('process.env');
+  });
 });

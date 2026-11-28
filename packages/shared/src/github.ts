@@ -92,6 +92,17 @@ export function rateLimitResourceFromPath(path: string, headerResource?: string)
   return 'core';
 }
 
+export function isRateLimitErrorMessage(message: string | undefined): boolean {
+  if (!message) return false;
+  return /\b429\b|rate limit|too many requests/i.test(message);
+}
+
+export interface GitHubRateLimitEvent {
+  kind: 'primary' | 'secondary';
+  status: number;
+  resource?: string;
+}
+
 export function inferRateLimitResource(surface: string, stored?: string | null): string {
   if (stored) return stored;
   if (surface === 'code') return 'code_search';
@@ -133,10 +144,12 @@ export class GitHubClient {
   private requestTail: Promise<void> = Promise.resolve();
   private lastSearchAt = 0;
   private readonly blockedUntil = new Map<string, number>();
+  private readonly onRateLimit?: (event: GitHubRateLimitEvent) => void;
 
-  constructor(env: NodeJS.ProcessEnv = process.env, options: { sleep?: SleepFn } = {}) {
+  constructor(env: NodeJS.ProcessEnv = process.env, options: { sleep?: SleepFn; onRateLimit?: (event: GitHubRateLimitEvent) => void } = {}) {
     this.tokenPool = new GitHubTokenPool(env);
     this.sleepFn = options.sleep ?? sleep;
+    this.onRateLimit = options.onRateLimit;
   }
 
   getEtag(cacheKey: string): string | undefined {
@@ -163,6 +176,11 @@ export class GitHubClient {
 
       if (performed.primaryRateLimit && retryOnRateLimit && !primaryRetried) {
         primaryRetried = true;
+        this.emitRateLimit({
+          kind: 'primary',
+          status: 403,
+          resource: performed.primaryRateLimit.resource
+        });
         if (this.tokenPool.size > 1) {
           this.tokenPool.rotate();
           continue;
@@ -176,6 +194,11 @@ export class GitHubClient {
       if (performed.secondaryRateLimit && attempt < SECONDARY_RATE_LIMIT_MAX_RETRIES) {
         const secondary = performed.secondaryRateLimit;
         const waitMs = secondaryRateLimitBackoffMs(secondary.retryAfter);
+        this.emitRateLimit({
+          kind: 'secondary',
+          status: secondary.status,
+          resource: secondary.rateLimit.resource
+        });
         console.log(JSON.stringify({
           event: 'github_secondary_rate_limit',
           at: new Date().toISOString(),
@@ -190,6 +213,14 @@ export class GitHubClient {
       }
 
       throw performed.error ?? performed.secondaryRateLimit?.error ?? new Error('GitHub request failed');
+    }
+  }
+
+  private emitRateLimit(event: GitHubRateLimitEvent): void {
+    try {
+      this.onRateLimit?.(event);
+    } catch {
+      // A stats observer must not break the GitHub request.
     }
   }
 

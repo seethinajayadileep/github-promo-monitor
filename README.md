@@ -97,6 +97,11 @@ The dashboard supports:
 - Admin-protected status changes through `ADMIN_SECRET`
 - Pagination (50 codes per page) that preserves search and filter state
 - `/health` plus a worker status bar with last scan time and separate core, search, and code-search rate-limit headroom
+- `/stats` for scanner, LLM, repository, and Exa usage. Token totals stay at zero until new LLM calls are stored. Exa stays visibly unconfigured until `EXA_API_KEY` is set. Times are Asia/Kolkata (IST).
+
+## Exa discovery lane
+
+When `EXA_API_KEY` is set, the worker runs a slow vendor-scoped search against `POST https://api.exa.ai/search` with `includeDomains: ["github.com"]`. Exa has no `github` category and no pagination, so each pass asks for at most 100 results and drops anything outside `github.com`. Hits still go through Pass-1 and the LLM gate. The default search type is `auto` with `contents.maxAgeHours` of 24 so cached pages can be refreshed; `lite` is cache-only and does not send that field. The lane interval is at least as long as the fast GitHub lane and defaults to 30 minutes, one vendor per pass.
 
 ## Render deployment
 
