@@ -123,6 +123,17 @@ export async function getLaneCursor(pool: pg.Pool, lane: string): Promise<number
   return Math.max(0, Number(result.rows[0]?.next_index ?? 0));
 }
 
+export async function getLaneCursorState(pool: pg.Pool, lane: string): Promise<{ nextIndex: number; cursorWindow: string | null }> {
+  const result = await pool.query<{ next_index: number; cursor_window: string | null }>(
+    'SELECT next_index, cursor_window FROM scan_lane_cursors WHERE lane = $1',
+    [lane]
+  );
+  return {
+    nextIndex: Math.max(0, Number(result.rows[0]?.next_index ?? 0)),
+    cursorWindow: result.rows[0]?.cursor_window ?? null
+  };
+}
+
 const FOLLOWABLE_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 export function isFollowableRepo(repo: string | undefined | null): repo is string {
@@ -173,13 +184,81 @@ export async function markFollowedRepoPolled(pool: pg.Pool, repoFullName: string
   await pool.query('UPDATE followed_repos SET last_polled_at = now() WHERE repo_full_name = $1', [repoFullName]);
 }
 
-export async function advanceLaneCursor(pool: pg.Pool, lane: string, nextIndex: number): Promise<void> {
+export async function advanceLaneCursor(pool: pg.Pool, lane: string, nextIndex: number, cursorWindow?: string | null): Promise<void> {
+  const index = Math.max(0, Math.floor(nextIndex));
+  if (cursorWindow === undefined) {
+    await pool.query(
+      `INSERT INTO scan_lane_cursors (lane, next_index, updated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (lane) DO UPDATE SET next_index = EXCLUDED.next_index, updated_at = now()`,
+      [lane, index]
+    );
+    return;
+  }
   await pool.query(
-    `INSERT INTO scan_lane_cursors (lane, next_index, updated_at)
-     VALUES ($1, $2, now())
-     ON CONFLICT (lane) DO UPDATE SET next_index = EXCLUDED.next_index, updated_at = now()`,
-    [lane, Math.max(0, Math.floor(nextIndex))]
+    `INSERT INTO scan_lane_cursors (lane, next_index, cursor_window, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (lane) DO UPDATE
+     SET next_index = EXCLUDED.next_index, cursor_window = EXCLUDED.cursor_window, updated_at = now()`,
+    [lane, index, cursorWindow]
   );
+}
+
+function missingSchema(error: unknown): boolean {
+  const code = error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : '';
+  return code === '42P01' || code === '42703';
+}
+
+export async function hasSeenCommitSha(pool: pg.Pool, repoFullName: string, sha: string): Promise<boolean> {
+  try {
+    const result = await pool.query('SELECT 1 FROM seen_commit_shas WHERE repo_full_name = $1 AND sha = $2', [repoFullName, sha]);
+    return (result.rowCount ?? result.rows.length) > 0;
+  } catch (error) {
+    if (missingSchema(error)) return false;
+    throw error;
+  }
+}
+
+export async function rememberCommitSha(pool: pg.Pool, repoFullName: string, sha: string): Promise<void> {
+  try {
+    await pool.query(
+      `INSERT INTO seen_commit_shas (repo_full_name, sha) VALUES ($1, $2)
+       ON CONFLICT (repo_full_name, sha) DO NOTHING`,
+      [repoFullName, sha]
+    );
+  } catch (error) {
+    if (missingSchema(error)) return;
+    throw error;
+  }
+}
+
+export async function readLlmInputCache(pool: pg.Pool, inputHash: string): Promise<{ outcome: 'accepted' | 'rejected'; resultJson: string | null } | null> {
+  try {
+    const result = await pool.query<{ outcome: 'accepted' | 'rejected'; result_json: string | null }>(
+      'SELECT outcome, result_json FROM llm_input_cache WHERE input_hash = $1',
+      [inputHash]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return { outcome: row.outcome, resultJson: row.result_json };
+  } catch (error) {
+    if (missingSchema(error)) return null;
+    throw error;
+  }
+}
+
+export async function writeLlmInputCache(pool: pg.Pool, inputHash: string, outcome: 'accepted' | 'rejected', resultJson: string | null): Promise<void> {
+  try {
+    await pool.query(
+      `INSERT INTO llm_input_cache (input_hash, outcome, result_json)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (input_hash) DO NOTHING`,
+      [inputHash, outcome, resultJson ? resultJson.slice(0, 4000) : null]
+    );
+  } catch (error) {
+    if (missingSchema(error)) return;
+    throw error;
+  }
 }
 
 function nonNegativeInt(value: number | undefined): number | null {

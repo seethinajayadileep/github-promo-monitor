@@ -38,9 +38,9 @@ export const config = {
   maxCodeFilesPerScan: numberEnv('MAX_CODE_FILES_PER_SCAN', 40),
   maxCommitSearchPages: numberEnv('MAX_COMMIT_SEARCH_PAGES', 10),
   maxIssueSearchPages: numberEnv('MAX_ISSUE_SEARCH_PAGES', 10),
-  // Code search is the lane that already sees secondary 429s, so it stops at 500 hits.
-  maxCodeSearchPages: numberEnv('MAX_CODE_SEARCH_PAGES', 5),
-  liveCommitWindowDays: numberEnv('LIVE_COMMIT_WINDOW_DAYS', 21),
+  // Code search allows 1,000 hits (10 pages). Stop early when total_count fits in fewer pages.
+  maxCodeSearchPages: numberEnv('MAX_CODE_SEARCH_PAGES', 10),
+  liveCommitWindowDays: numberEnv('LIVE_COMMIT_WINDOW_DAYS', 2),
   maxFollowedReposPerScan: numberEnv('MAX_FOLLOWED_REPOS_PER_SCAN', 30),
   followedRepoCommitPageSize: numberEnv('FOLLOWED_REPO_COMMIT_PAGE_SIZE', 30),
   maxFollowedCommitDetailsPerRepo: numberEnv('MAX_FOLLOWED_COMMIT_DETAILS_PER_REPO', 15),

@@ -323,4 +323,43 @@ describe('worker polling lanes', () => {
     expect(queries.some(({ sql, params }) => sql.includes('INSERT INTO followed_repos') && !sql.includes('SELECT') && params?.[0] === 'acme/promo-notes')).toBe(true);
     expect(queries.filter(({ sql }) => sql.includes('UPDATE followed_repos')).map(({ params }) => params?.[0])).toEqual(['acme/promo-notes']);
   });
+
+  it('does not refetch a commit diff for a SHA already stored', async () => {
+    const { pool } = createFakePool(0);
+    const seen = new Set<string>();
+    const inner = pool.query.bind(pool);
+    pool.query = async (sql: string, params?: unknown[]) => {
+      if (sql.includes('seen_commit_shas') && sql.startsWith('SELECT')) {
+        const key = `${params?.[0]}@${params?.[1]}`;
+        return { rows: seen.has(key) ? [{ ok: 1 }] : [], rowCount: seen.has(key) ? 1 : 0 };
+      }
+      if (sql.includes('INSERT INTO seen_commit_shas')) {
+        seen.add(`${params?.[0]}@${params?.[1]}`);
+        return { rows: [], rowCount: 1 };
+      }
+      return inner(sql, params);
+    };
+    const github = createGitHub((path) => {
+      if (path.startsWith('/search/commits')) {
+        return {
+          data: {
+            total_count: 1,
+            items: [{
+              html_url: 'https://github.com/acme/dedupe/commit/sha-dedupe-only',
+              sha: 'sha-dedupe-only',
+              repository: { full_name: 'acme/dedupe' },
+              commit: { message: 'routine dependency update', committer: { date: '2026-01-01T00:00:00Z' } }
+            }]
+          }
+        };
+      }
+      if (path.startsWith('/search/issues')) return { data: { total_count: 0, items: [] } };
+      return { data: { commit: { message: 'routine' }, files: [] } };
+    });
+    const options = { pool: pool as never, github: github as never, vendors: liveVendors, watchlist: [] };
+    await scanFastLane(options);
+    await scanFastLane(options);
+    const details = github.requests.filter((path) => path.includes('/commits/sha-dedupe-only'));
+    expect(details).toHaveLength(1);
+  });
 });

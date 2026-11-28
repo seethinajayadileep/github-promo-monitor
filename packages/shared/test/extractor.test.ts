@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyLlmExtraction,
   buildSarvamChatRequest,
@@ -603,6 +603,25 @@ describe('LLM extraction helpers', () => {
       expect(result[0]?.vendor).toBe('LeanMCP');
       expect(bodies[0]).toContain('LeanMCP product console');
       expect(bodies[0]).toContain('https://leanmcp.com/redeem');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('does not call the LLM again when the same input was already rejected', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const fetchMock = vi.fn();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      const result = await enrichAndGateCandidates(
+        [sampleCandidate],
+        vendors,
+        () => undefined,
+        { lookupCache: async () => ({ outcome: 'rejected' }) }
+      );
+      expect(result).toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = originalFetch;
     }

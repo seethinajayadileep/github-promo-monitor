@@ -10,7 +10,8 @@ export const GITHUB_SEARCH_MAX_OPERATORS = 5;
  * Reserved suffix budget so the same base query stays valid after
  * `committer-date:` (commits/backfill) or `is:issue` / `is:pr` is appended.
  */
-export const GITHUB_SEARCH_QUALIFIER_RESERVE = 40;
+/** Room for an hour-level `committer-date:` or `created:` suffix. */
+export const GITHUB_SEARCH_QUALIFIER_RESERVE = 72;
 
 /** High-signal promo cues for commit and issue search (one OR, so four operators remain). */
 export const DEFAULT_PROMO_CUE = '"promo code" OR coupon';
@@ -92,49 +93,9 @@ export function formatCueAndTerms(cue: string, terms: string[]): string {
   return normalizeQuery(`${wrapIfBoolean(cue)} AND (${terms.join(' OR ')})`);
 }
 
-function packTermsWithCue(cue: string, terms: string[], reserveChars: number): string[] {
-  if (!terms.length) {
-    const only = formatCueAndTerms(cue, []);
-    if (!isValidGitHubSearchQuery(only, reserveChars)) {
-      throw new Error(`Promo cue exceeds GitHub Search limits: ${only}`);
-    }
-    return [only];
-  }
-
-  const queries: string[] = [];
-  let batch: string[] = [];
-
-  const flush = () => {
-    if (!batch.length) return;
-    queries.push(formatCueAndTerms(cue, batch));
-    batch = [];
-  };
-
-  for (const term of terms) {
-    const candidate = [...batch, term];
-    const query = formatCueAndTerms(cue, candidate);
-    if (isValidGitHubSearchQuery(query, reserveChars)) {
-      batch = candidate;
-      continue;
-    }
-    if (batch.length) {
-      flush();
-      const single = formatCueAndTerms(cue, [term]);
-      if (!isValidGitHubSearchQuery(single, reserveChars)) {
-        throw new Error(`Cannot fit term into a valid GitHub Search query: ${term}`);
-      }
-      batch = [term];
-      continue;
-    }
-    throw new Error(`Cannot fit term into a valid GitHub Search query: ${term}`);
-  }
-  flush();
-  return queries;
-}
-
 /**
- * Build commit/issue search queries that stay within GitHub's 256-character
- * and five-operator limits, leaving room for date or `is:issue` suffixes.
+ * One vendor term per commit/issue query. GitHub drops a parenthesized
+ * `AND (A OR B OR C)` group, so every vendor in a bundle used to see the same hits.
  */
 export function buildSearchQueries(
   vendors: VendorConfig[],
@@ -142,7 +103,16 @@ export function buildSearchQueries(
 ): string[] {
   const cue = options?.cue ?? DEFAULT_PROMO_CUE;
   const reserveChars = options?.reserveChars ?? GITHUB_SEARCH_QUALIFIER_RESERVE;
-  return packTermsWithCue(cue, collectVendorSearchTerms(vendors), reserveChars);
+  return collectVendorSearchTerms(vendors).map((term) => {
+    const query = formatCueAndTerms(cue, [term]);
+    if (/\([^)]*\bOR\b[^)]*\)/i.test(query.replace(/\([^)]*promo code[^)]*\)/i, ''))) {
+      throw new Error(`Vendor OR group is not allowed in commit/issue search: ${query}`);
+    }
+    if (!isValidGitHubSearchQuery(query, reserveChars)) {
+      throw new Error(`Cannot fit term into a valid GitHub Search query: ${term}`);
+    }
+    return query;
+  });
 }
 
 /**
@@ -189,4 +159,55 @@ export function addRecentCommitDateWindow(query: string, days: number, now = new
 export function addIssueQualifier(query: string, kind: 'issue' | 'pr' = 'issue'): string {
   const qualifier = kind === 'pr' ? 'is:pr' : 'is:issue';
   return normalizeQuery(`${query} ${qualifier}`);
+}
+
+export function addIssueDateWindow(query: string, start: string, end: string): string {
+  return normalizeQuery(`${addIssueQualifier(query, 'issue')} created:${start}..${end}`);
+}
+
+/** Smallest slice. GitHub accepts hour-level timestamps; we do not cut finer than this. */
+export const MIN_SEARCH_SLICE_MS = 60 * 60 * 1000;
+
+export function formatSearchInstant(date: Date): string {
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** Inclusive date-only end becomes the next UTC midnight so slices do not overlap a whole day. */
+export function parseBoundedWindow(spec: string): { start: Date; endExclusive: Date } | null {
+  const match = spec.match(/^(\S+)\.\.(\S+)$/);
+  if (!match) return null;
+  const start = parseSearchInstant(match[1], false);
+  const endExclusive = parseSearchInstant(match[2], true);
+  if (!start || !endExclusive || endExclusive.getTime() <= start.getTime()) return null;
+  return { start, endExclusive };
+}
+
+function parseSearchInstant(value: string, inclusiveDateEnd: boolean): Date | null {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const date = new Date(`${value}T00:00:00Z`);
+    if (Number.isNaN(date.getTime())) return null;
+    if (inclusiveDateEnd) date.setUTCDate(date.getUTCDate() + 1);
+    return date;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/** Split a window in half. Returns null once the slice is an hour or smaller. */
+export function halveSearchWindow(start: Date, endExclusive: Date): { left: string; right: string } | null {
+  const span = endExclusive.getTime() - start.getTime();
+  if (span <= MIN_SEARCH_SLICE_MS) return null;
+  const mid = new Date(start.getTime() + Math.floor(span / 2));
+  if (mid.getTime() <= start.getTime() || mid.getTime() >= endExclusive.getTime()) return null;
+  return {
+    left: `${formatSearchInstant(start)}..${formatSearchInstant(mid)}`,
+    right: `${formatSearchInstant(mid)}..${formatSearchInstant(endExclusive)}`
+  };
+}
+
+export function pagesNeededForTotal(totalCount: number, pageSize: number, maxPages: number): number {
+  if (pageSize <= 0) return 1;
+  if (totalCount <= 0) return 1;
+  const capped = Math.min(totalCount, 1000);
+  return Math.min(Math.max(1, maxPages), Math.max(1, Math.ceil(capped / pageSize)));
 }
