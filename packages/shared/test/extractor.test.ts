@@ -12,9 +12,14 @@ import {
   parseExpiry,
   parseLlmJson,
   splitCodeList,
+  OPENAI_CHAT_COMPLETIONS_URL,
+  OPENAI_DEFAULT_MAX_COMPLETION_TOKENS,
+  OPENAI_DEFAULT_MODEL,
+  OPENAI_DEFAULT_REASONING_EFFORT,
   SARVAM_DEFAULT_MODEL,
   SARVAM_DEFAULT_URL,
-  SARVAM_MAX_TOKENS
+  SARVAM_MAX_TOKENS,
+  buildOpenAiChatRequest
 } from '../src/extractor.js';
 import type { PromoCandidate, VendorConfig } from '../src/types.js';
 
@@ -243,6 +248,10 @@ describe('LLM extraction helpers', () => {
     delete process.env.SARVAM_API_URL;
     delete process.env.SARVAM_MODEL;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_MODEL;
+    delete process.env.OPENAI_REASONING_EFFORT;
+    delete process.env.OPENAI_MAX_COMPLETION_TOKENS;
+    delete process.env.OPENAI_TIMEOUT_MS;
     delete process.env.GEMINI_API_KEY;
   });
 
@@ -263,7 +272,25 @@ describe('LLM extraction helpers', () => {
     expect(request.body.max_tokens).toBeGreaterThanOrEqual(1536);
     expect(configuredLlmProvider()).toBe('sarvam');
     process.env.OPENAI_API_KEY = 'openai-key';
-    expect(configuredLlmProvider()).toBe('sarvam');
+    expect(configuredLlmProvider()).toBe('openai');
+  });
+
+  it('builds a strict GPT-6 Luna request and prefers it over Sarvam when both keys are set', () => {
+    process.env.OPENAI_API_KEY = 'openai-key';
+    process.env.SARVAM_API_KEY = 'sarvam-key';
+    const request = buildOpenAiChatRequest('hello');
+    expect(configuredLlmProvider()).toBe('openai');
+    expect(request.url).toBe(OPENAI_CHAT_COMPLETIONS_URL);
+    expect(request.headers.authorization).toBe('Bearer openai-key');
+    expect(request.body.model).toBe(OPENAI_DEFAULT_MODEL);
+    expect(request.body.reasoning_effort).toBe(OPENAI_DEFAULT_REASONING_EFFORT);
+    expect(request.body.max_completion_tokens).toBe(OPENAI_DEFAULT_MAX_COMPLETION_TOKENS);
+    expect(request.body.response_format).toMatchObject({
+      type: 'json_schema',
+      json_schema: { name: 'public_promo_extraction', strict: true }
+    });
+    expect(request.body).not.toHaveProperty('temperature');
+    expect(request.body.response_format.json_schema.schema.required).toContain('is_public_promo');
   });
 
   it('parses JSON even when wrapped in fences or preceded by reasoning text', () => {
@@ -294,6 +321,76 @@ describe('LLM extraction helpers', () => {
       confidence: 'high'
     }, vendors);
     expect(promoted).toMatchObject({ vendor: 'Apify', code: 'APIFY_CAL_HACKS', confidence: 'high' });
+  });
+
+  it('calls GPT-6 Luna, retries an empty length response with a larger budget, and drops refusals', async () => {
+    process.env.OPENAI_API_KEY = 'openai-key';
+    process.env.SARVAM_API_KEY = 'sarvam-key';
+    const originalFetch = globalThis.fetch;
+    const bodies: Array<{ model?: string; reasoning_effort?: string; max_completion_tokens?: number; temperature?: number }> = [];
+    const urls: string[] = [];
+    let calls = 0;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      calls += 1;
+      urls.push(String(url));
+      bodies.push(JSON.parse(String(init?.body)));
+      if (calls === 1) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: '' }, finish_reason: 'length' }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      if (calls === 2) {
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: '', refusal: 'cannot help' }, finish_reason: 'stop' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: '{"is_public_promo":true,"vendor":"Apify","code":"APIFY2026","offer_summary":"credits","redeem_url":null,"expires_at":null,"confidence":"high"}' },
+          finish_reason: 'stop'
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const events: Array<[string, Record<string, unknown>]> = [];
+      const rejected = await enrichAndGateCandidates([sampleCandidate], vendors, (event, details) => events.push([event, details]));
+      expect(rejected).toEqual([]);
+      expect(String(events[0]?.[1]?.reason)).toContain('refusal');
+      const approved = await extractWithLlm('Use code APIFY2026 for Apify credits.', vendors);
+      expect(approved).toMatchObject({ isPublicPromo: true, vendor: 'Apify', code: 'APIFY2026' });
+      expect(urls.every((url) => url === OPENAI_CHAT_COMPLETIONS_URL)).toBe(true);
+      expect(bodies[0]?.model).toBe('gpt-6-luna');
+      expect(bodies[0]?.reasoning_effort).toBe('none');
+      expect(bodies[0]?.temperature).toBeUndefined();
+      expect(bodies[1]?.max_completion_tokens).toBeGreaterThan(bodies[0]?.max_completion_tokens ?? 0);
+      expect(calls).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('retries a GPT-6 Luna timeout and then accepts structured JSON', async () => {
+    process.env.OPENAI_API_KEY = 'openai-key';
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('The operation was aborted due to timeout');
+      return new Response(JSON.stringify({
+        choices: [{
+          message: { content: '{"is_public_promo":false,"vendor":null,"code":null,"offer_summary":null,"redeem_url":null,"expires_at":null,"confidence":"low"}' },
+          finish_reason: 'stop'
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const result = await extractWithLlm('Use code APIFY2026 for Apify credits.', vendors);
+      expect(calls).toBe(2);
+      expect(result).toEqual({ isPublicPromo: false });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it('calls Sarvam and drops a rejected false positive from extractWithLlm', async () => {

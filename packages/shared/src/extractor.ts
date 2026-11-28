@@ -77,6 +77,27 @@ const TECH_PREFIX_PATTERN = /^(?:UTF|UTF8|SHA|SHA1|SHA2|SHA3|MD5|AES|RSA|HTTP|HT
 export const SARVAM_DEFAULT_URL = 'https://api.sarvam.ai/v2/chat/completions';
 export const SARVAM_DEFAULT_MODEL = 'sarvam-105b';
 export const SARVAM_MAX_TOKENS = 4096;
+export const OPENAI_DEFAULT_MODEL = 'gpt-6-luna';
+export const OPENAI_DEFAULT_REASONING_EFFORT = 'none';
+export const OPENAI_DEFAULT_MAX_COMPLETION_TOKENS = 1024;
+export const OPENAI_MAX_COMPLETION_TOKEN_CEILING = 8192;
+export const OPENAI_DEFAULT_TIMEOUT_MS = 30_000;
+export const OPENAI_CHAT_COMPLETIONS_URL = 'https://api.openai.com/v1/chat/completions';
+
+export const PROMO_EXTRACTION_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    is_public_promo: { type: 'boolean' },
+    vendor: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    code: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    offer_summary: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    redeem_url: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    expires_at: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    confidence: { type: 'string', enum: ['high', 'medium', 'low'] }
+  },
+  required: ['is_public_promo', 'vendor', 'code', 'offer_summary', 'redeem_url', 'expires_at', 'confidence']
+} as const;
 
 const LLM_SYSTEM_PROMPT = 'Extract only intentionally public, actionable SaaS/AI/developer-tool promotional, coupon, or credit codes a person can redeem. Never output credentials. Name the exact product or service where the code is redeemed. Never use UI or component words such as Modal, Dialog, Button, Popup, or Banner as the vendor; never answer GitHub merely because the snippet is hosted on GitHub; reject UI popup demos such as a 1-Click Coupon Modal. Reject environment-variable and identifier names (ELEVENLABS_API_KEY, DISCOUNT_CODE, ADMIN_ACCESS_TOKEN, or tokens ending in _ID, _TOKEN, _KEY, _SECRET, _CODE), placeholder strings (YOUR_CODE_HERE, PROMO123), CSS/UI tokens, license IDs, CVEs, commit SHAs, and generic English or hyphenated tech phrases (CROSS-BROWSER, STEP-BY-STEP, OPEN-SOURCE, SINGLE-FILE). If multiple real comma-separated codes are intentionally listed, return them exactly as a comma-separated code string. Return strict JSON.';
 
@@ -470,8 +491,8 @@ export function parseLlmJson(value: string): ExtractedPromo | null {
 }
 
 export function configuredLlmProvider(env: NodeJS.ProcessEnv = process.env): LlmProvider {
-  if (env.SARVAM_API_KEY) return 'sarvam';
   if (env.OPENAI_API_KEY) return 'openai';
+  if (env.SARVAM_API_KEY) return 'sarvam';
   if (env.GEMINI_API_KEY) return 'gemini';
   return 'none';
 }
@@ -486,6 +507,68 @@ export interface SarvamChatRequest {
     temperature: number;
     reasoning_effort: 'low';
     max_tokens: number;
+  };
+}
+
+function positiveIntEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const parsed = Number(env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+export function nextOpenAiTokenBudget(current: number): number {
+  return Math.min(OPENAI_MAX_COMPLETION_TOKEN_CEILING, Math.max(current * 4, current + OPENAI_DEFAULT_MAX_COMPLETION_TOKENS));
+}
+
+export interface OpenAiChatRequest {
+  url: string;
+  headers: Record<string, string>;
+  timeoutMs: number;
+  body: {
+    model: string;
+    messages: Array<{ role: string; content: string }>;
+    reasoning_effort: string;
+    max_completion_tokens: number;
+    response_format: {
+      type: 'json_schema';
+      json_schema: {
+        name: 'public_promo_extraction';
+        strict: true;
+        schema: typeof PROMO_EXTRACTION_JSON_SCHEMA;
+      };
+    };
+  };
+}
+
+export function buildOpenAiChatRequest(
+  prompt: string,
+  env: NodeJS.ProcessEnv = process.env,
+  maxCompletionTokens = positiveIntEnv(env, 'OPENAI_MAX_COMPLETION_TOKENS', OPENAI_DEFAULT_MAX_COMPLETION_TOKENS)
+): OpenAiChatRequest {
+  const cappedTokens = Math.min(OPENAI_MAX_COMPLETION_TOKEN_CEILING, Math.max(256, Math.floor(maxCompletionTokens)));
+  return {
+    url: OPENAI_CHAT_COMPLETIONS_URL,
+    timeoutMs: Math.max(5_000, positiveIntEnv(env, 'OPENAI_TIMEOUT_MS', OPENAI_DEFAULT_TIMEOUT_MS)),
+    headers: {
+      authorization: `Bearer ${env.OPENAI_API_KEY ?? ''}`,
+      'content-type': 'application/json'
+    },
+    body: {
+      model: env.OPENAI_MODEL || OPENAI_DEFAULT_MODEL,
+      messages: [
+        { role: 'system', content: LLM_SYSTEM_PROMPT },
+        { role: 'user', content: prompt }
+      ],
+      reasoning_effort: env.OPENAI_REASONING_EFFORT || OPENAI_DEFAULT_REASONING_EFFORT,
+      max_completion_tokens: cappedTokens,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'public_promo_extraction',
+          strict: true,
+          schema: PROMO_EXTRACTION_JSON_SCHEMA
+        }
+      }
+    }
   };
 }
 
@@ -609,26 +692,79 @@ async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
   return { content: null, failureReason: lastReason };
 }
 
-async function callOpenAi(prompt: string): Promise<string | null> {
+async function callOpenAiDetailed(prompt: string): Promise<LlmCallOutcome> {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      temperature: 0,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: LLM_SYSTEM_PROMPT },
-        { role: 'user', content: prompt }
-      ]
-    }),
-    signal: AbortSignal.timeout(20_000)
-  });
-  if (!response.ok) return null;
-  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  return body.choices?.[0]?.message?.content ?? null;
+  if (!apiKey) return { content: null, failureReason: 'missing-api-key' };
+  let maxTokens = positiveIntEnv(process.env, 'OPENAI_MAX_COMPLETION_TOKENS', OPENAI_DEFAULT_MAX_COMPLETION_TOKENS);
+  let lastReason = 'unknown';
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const request = buildOpenAiChatRequest(prompt, process.env, maxTokens);
+    try {
+      const response = await fetch(request.url, {
+        method: 'POST',
+        headers: request.headers,
+        body: JSON.stringify(request.body),
+        signal: AbortSignal.timeout(request.timeoutMs)
+      });
+      if (!response.ok) {
+        const snippet = await responseErrorSnippet(response);
+        lastReason = `http-${response.status}${snippet ? `: ${snippet}` : ''}`;
+        if (attempt < 2 && transientHttpStatus(response.status)) {
+          await delay(retryDelayMs(attempt));
+          continue;
+        }
+        return { content: null, failureReason: lastReason };
+      }
+      let body: {
+        choices?: Array<{
+          message?: { content?: string | null; refusal?: string | null };
+          finish_reason?: string;
+        }>;
+      };
+      try {
+        body = await response.json() as typeof body;
+      } catch {
+        lastReason = 'invalid-json-response';
+        if (attempt < 2) {
+          await delay(retryDelayMs(attempt));
+          continue;
+        }
+        return { content: null, failureReason: lastReason };
+      }
+      const choice = body.choices?.[0];
+      const finishReason = choice?.finish_reason;
+      const refusal = choice?.message?.refusal?.trim() ?? '';
+      const content = choice?.message?.content ?? '';
+      if (refusal && !content.trim()) return { content: null, failureReason: `refusal: ${refusal.slice(0, 240)}` };
+      if (finishReason === 'content_filter') return { content: null, failureReason: 'content-filter' };
+      if (content.trim() && parseLlmJson(content)) return { content };
+      if (finishReason === 'length') {
+        lastReason = content.trim() ? 'finish-length-truncated-output' : 'finish-length-empty-content';
+        maxTokens = nextOpenAiTokenBudget(request.body.max_completion_tokens);
+      } else if (!content.trim()) {
+        lastReason = finishReason ? `empty-content-finish-${finishReason}` : 'empty-content-no-finish-reason';
+      } else {
+        lastReason = 'unparseable-json-response';
+      }
+      if (attempt < 2) {
+        await delay(retryDelayMs(attempt));
+        continue;
+      }
+      return { content: null, failureReason: lastReason };
+    } catch (error) {
+      const name = error instanceof Error ? error.name : '';
+      const message = error instanceof Error ? error.message : 'unknown';
+      lastReason = name === 'TimeoutError' || name === 'AbortError' || /timed out|timeout/i.test(message)
+        ? `timeout: ${message}`
+        : `network-error: ${message}`;
+      if (attempt < 2) {
+        await delay(retryDelayMs(attempt));
+        continue;
+      }
+      return { content: null, failureReason: lastReason };
+    }
+  }
+  return { content: null, failureReason: lastReason };
 }
 
 async function callGemini(prompt: string): Promise<string | null> {
@@ -669,10 +805,18 @@ export async function extractWithLlmDetailed(text: string, vendors: VendorConfig
       ? { result: parsed }
       : { result: null, failureReason: 'unparseable-json-response' };
   }
-  const raw = provider === 'openai' ? await callOpenAi(prompt) : await callGemini(prompt);
-  if (!raw) return { result: null, failureReason: `${provider}-empty-or-error` };
+  if (provider === 'openai') {
+    const outcome = await callOpenAiDetailed(prompt);
+    if (!outcome.content) return { result: null, failureReason: outcome.failureReason ?? 'empty-response' };
+    const parsed = parseLlmJson(outcome.content);
+    return parsed
+      ? { result: parsed }
+      : { result: null, failureReason: 'unparseable-json-response' };
+  }
+  const raw = await callGemini(prompt);
+  if (!raw) return { result: null, failureReason: 'gemini-empty-or-error' };
   const parsed = parseLlmJson(raw);
-  return parsed ? { result: parsed } : { result: null, failureReason: `${provider}-unparseable-json-response` };
+  return parsed ? { result: parsed } : { result: null, failureReason: 'gemini-unparseable-json-response' };
 }
 
 /** Stage 3 pass 2: optional low-cost LLM cleanup. Returns null when unconfigured or inconclusive. */

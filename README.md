@@ -41,7 +41,7 @@ Pass 1 requires both:
 
 Pass 1 also blocks generic uppercase stopwords (`README`, `LICENSE`, `OPENAI`, `HTTPS`, etc.), vendor-name tokens, license/CVE identifiers, and common non-promo compounds (`BSD-3-CLAUSE`, `TIME-LIMITED`, `CVE-2026-…`). Codes must appear near the vendor name or domain, and low-confidence hits that only matched a docs URL elsewhere in a large file are dropped.
 
-Pass 2 optionally calls a low-cost LLM structured JSON extractor. `SARVAM_API_KEY` (Sarvam 105B) takes priority, then `OPENAI_API_KEY`, then `GEMINI_API_KEY`. If none is configured, extraction continues with pass 1 only. When the LLM is configured and returns `is_public_promo=false` or no valid code, the candidate is dropped. The expected JSON shape is:
+Pass 2 calls a structured JSON extractor when a provider key is set. `OPENAI_API_KEY` selects OpenAI `gpt-6-luna` (Chat Completions with strict `json_schema`, `reasoning_effort=none`) and takes priority. If that key is unset, `SARVAM_API_KEY` (Sarvam 105B) is the fallback, then `GEMINI_API_KEY`. If none is configured, extraction continues with pass 1 only. Empty, truncated, timeout, and refusal responses are retried when the failure can succeed on another attempt, then the candidate is dropped. When the LLM returns `is_public_promo=false` or no valid code, the candidate is dropped. The expected JSON shape is:
 
 ```json
 {
@@ -58,9 +58,10 @@ Pass 2 optionally calls a low-cost LLM structured JSON extractor. `SARVAM_API_KE
 ## GitHub polling design
 
 - Vendors from `vendors.json` are bundled into about seven combined `OR` search query groups.
-- **Fast lane (default every 90 seconds):** Commits Search sorted by `committer-date` plus Issues Search sorted by `created`.
-- **Slow lane (default every 20 minutes):** Code Search over `README.md`, `PERKS.md`, and `docs/`.
+- **Fast lane (default every 90 seconds):** Commits Search sorted by `committer-date` plus Issues Search sorted by `created`. Each query can walk up to 10 pages of 100 hits (GitHub's 1000-result cap). The live commit window is 21 days so a recent push of slightly older commits is still visible. Issue search uses the same page size and page cap instead of a single page.
+- **Slow lane (default every 20 minutes):** Code Search over `README.md` and `docs/`. Code search stops at 5 pages (500 hits). That lane is the one that sees GitHub secondary 429s; a failed later page keeps the hits already fetched, and the client still waits out the 429 without blocking the other lanes.
 - **Watchlist:** Repositories in `watchlist.json` are polled directly with Core REST `GET /repos/{owner}/{repo}/commits`; matching commits are expanded through commit-detail API calls.
+- **Followed repos:** Any repository that yields an accepted public promo is recorded in `followed_repos` (existing non-flagged codes are seeded by migration). Each watchlist cycle polls the stalest of those repos, skipping names already on the static watchlist, and inspects their newest commits. A later push to a known promo repo is therefore picked up even when global search does not return it. Pass 1 and the LLM gate are unchanged, so secrets, crypto/web3, and spam coupon dumps are still dropped.
 - **Historical backfill:** The worker walks backwards through `committer-date:YYYY-MM-DD..YYYY-MM-DD` windows, fetch commit diffs, persists every window in `scan_runs`, and never alerts for historical finds. A window is marked complete only after every query in that window succeeds.
 - **Adaptive pacing:** Serializes GitHub requests across lanes, reads `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After`, and uses conditional `If-None-Match` requests with ETags. Secondary rate limits / 403 abuse detection wait at least 60 seconds with jitter. Backfill backs off when less than roughly 30% rate-limit budget remains. `/health` reports core, search, and code-search headroom separately.
 - **Token pool:** Supports one `GITHUB_TOKEN` or comma-separated `GITHUB_TOKENS`.
@@ -107,15 +108,16 @@ Render Blueprints require a repository containing `render.yaml`.
 
 In Render, choose **New + → Blueprint**, connect the repository, and select `render.yaml`. Render creates:
 
-1. `promo-db` — managed PostgreSQL
-2. `promo-worker` — always-on background worker
-3. `promo-dashboard` — Next.js web service
+1. `promo-db` — managed PostgreSQL (`basic-256mb`)
+2. `promo-worker` — always-on background worker on the `1c-2g` plan (1 CPU, 2 GB) so wider scans have more RAM and CPU than the previous `0.5c-512mb` worker
+3. `promo-dashboard` — Next.js web service (`0.5c-512mb`)
 
 ### 3. Set secret environment variables
 
 At minimum configure on `promo-worker`:
 
 - `GITHUB_TOKEN` or `GITHUB_TOKENS`
+- `OPENAI_API_KEY` for the GPT-6 Luna gate (`OPENAI_MODEL` defaults to `gpt-6-luna` in `render.yaml`). Leave it unset to keep the Sarvam fallback when `SARVAM_API_KEY` is set.
 
 Configure on `promo-dashboard`:
 
@@ -175,6 +177,7 @@ Unit coverage includes:
 
 - `vendors.json` — target vendors, categories, keywords, and redemption domains
 - `watchlist.json` — high-value repositories polled directly through the Core REST API
+- `followed_repos` — repositories that already produced an accepted promo; polled with the watchlist so later pushes show up on the dashboard
 - `.env.example` — every supported runtime setting
 - `render.yaml` — database, worker, and web service blueprint
 

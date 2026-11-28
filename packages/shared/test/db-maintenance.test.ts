@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import { advanceLaneCursor, getLaneCursor, pruneScanRuns, upsertPromoCandidate } from '../src/db.js';
+import {
+  advanceLaneCursor,
+  getLaneCursor,
+  isFollowableRepo,
+  listFollowedRepos,
+  markFollowedRepoPolled,
+  pruneScanRuns,
+  rememberFollowedRepo,
+  upsertPromoCandidate
+} from '../src/db.js';
 import type { PromoCandidate } from '../src/types.js';
 
 describe('scan lane cursors and retention', () => {
@@ -20,6 +29,33 @@ describe('scan lane cursors and retention', () => {
     const pool = { query } as never;
     await expect(pruneScanRuns(pool, 7)).resolves.toBe(12);
     expect(query).toHaveBeenCalledWith(expect.stringContaining('DELETE FROM scan_runs'), [7, 'backfill-window-complete']);
+  });
+});
+
+describe('followed repos', () => {
+  it('remembers only owner/name repos that can be polled later', async () => {
+    const query = vi.fn().mockResolvedValue({ rowCount: 1 });
+    const pool = { query } as never;
+    expect(isFollowableRepo('acme/promo-notes')).toBe(true);
+    expect(isFollowableRepo('unknown/unknown')).toBe(false);
+    expect(isFollowableRepo('not a repo')).toBe(false);
+    await rememberFollowedRepo(pool, 'acme/promo-notes', true);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO followed_repos'), ['acme/promo-notes', true]);
+    query.mockClear();
+    await rememberFollowedRepo(pool, 'unknown/unknown', true);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('lists the stalest followed repos and can mark one polled', async () => {
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ repo_full_name: 'acme/promo-notes' }] })
+      .mockResolvedValueOnce({ rowCount: 1 });
+    const pool = { query } as never;
+    await expect(listFollowedRepos(pool, 30, ['mlh/keep'])).resolves.toEqual(['acme/promo-notes']);
+    expect(query.mock.calls[0][0]).toContain('last_polled_at ASC NULLS FIRST');
+    expect(query.mock.calls[0][1]).toEqual([30, ['mlh/keep']]);
+    await markFollowedRepoPolled(pool, 'acme/promo-notes');
+    expect(query.mock.calls[1][1]).toEqual(['acme/promo-notes']);
   });
 });
 
