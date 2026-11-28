@@ -1,4 +1,4 @@
-import { GitHubClient, applyDailyExpiry, configuredLlmProvider, createPool } from '@promo/shared';
+import { GitHubClient, applyDailyExpiry, configuredLlmProvider, createPool, pruneScanRuns } from '@promo/shared';
 import { config, loadVendors, loadWatchlist } from './config.js';
 import { scanFastLane, scanHistoricalBackfill, scanSlowLane, scanWatchlist, type PollerOptions } from './poller.js';
 
@@ -51,7 +51,8 @@ async function main(): Promise<void> {
 
   const dailyExpiry = async () => {
     const result = await applyDailyExpiry(pool);
-    log('daily_expiry_complete', result);
+    const prunedScanRuns = await pruneScanRuns(pool, config.scanRunRetentionDays);
+    log('daily_expiry_complete', { ...result, prunedScanRuns });
   };
   await runSafely('daily-expiry', dailyExpiry);
 

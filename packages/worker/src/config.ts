@@ -33,6 +33,10 @@ export const config = {
   minimumRateLimitPercent: numberEnv('BACKFILL_MINIMUM_RATE_LIMIT_PERCENT', 30),
   liveMinimumRateLimitPercent: numberEnv('LIVE_MINIMUM_RATE_LIMIT_PERCENT', 3),
   backfillStopDate: process.env.BACKFILL_STOP_DATE || '2020-01-01',
-  maxCommitDetailsPerScan: numberEnv('MAX_COMMIT_DETAILS_PER_SCAN', 3),
-  maxCodeFilesPerScan: numberEnv('MAX_CODE_FILES_PER_SCAN', 3)
+  maxCommitDetailsPerScan: numberEnv('MAX_COMMIT_DETAILS_PER_SCAN', 30),
+  maxCodeFilesPerScan: numberEnv('MAX_CODE_FILES_PER_SCAN', 8),
+  maxCommitSearchPages: numberEnv('MAX_COMMIT_SEARCH_PAGES', 5),
+  maxCodeSearchPages: numberEnv('MAX_CODE_SEARCH_PAGES', 3),
+  liveCommitWindowDays: numberEnv('LIVE_COMMIT_WINDOW_DAYS', 7),
+  scanRunRetentionDays: numberEnv('SCAN_RUN_RETENTION_DAYS', 7)
 };

@@ -150,4 +150,62 @@ describe('secondary rate-limit backoff', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('does not hold the request lock during secondary backoff, so other lanes continue', async () => {
+    const sleepers: Array<{ ms: number; resolve: () => void }> = [];
+    let searchCalls = 0;
+    let coreCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('/search/commits')) {
+        searchCalls += 1;
+        if (searchCalls === 1) {
+          return jsonResponse(429, { message: 'Too many requests' }, {
+            'retry-after': '60',
+            'x-ratelimit-remaining': '20',
+            'x-ratelimit-limit': '30',
+            'x-ratelimit-resource': 'search'
+          });
+        }
+        return jsonResponse(200, { items: [], total_count: 0 }, {
+          'x-ratelimit-remaining': '19',
+          'x-ratelimit-limit': '30',
+          'x-ratelimit-resource': 'search'
+        });
+      }
+      coreCalls += 1;
+      return jsonResponse(200, { ok: true }, {
+        'x-ratelimit-remaining': '4999',
+        'x-ratelimit-limit': '5000',
+        'x-ratelimit-resource': 'core'
+      });
+    }) as typeof fetch;
+    try {
+      const client = new GitHubClient({ GITHUB_TOKEN: 'test-token' }, {
+        sleep: async (ms) => {
+          if (ms < SECONDARY_RATE_LIMIT_MIN_WAIT_MS) return;
+          await new Promise<void>((resolve) => sleepers.push({ ms, resolve }));
+        }
+      });
+      const searchPromise = client.request('/search/commits?q=test');
+      for (let attempt = 0; attempt < 50 && sleepers.length === 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      expect(sleepers.length).toBe(1);
+      const corePromise = client.request('/repos/acme/demo/commits?per_page=5');
+      const coreResult = await Promise.race([
+        corePromise.then(() => 'completed'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 100))
+      ]);
+      expect(coreResult).toBe('completed');
+      expect(coreCalls).toBe(1);
+      sleepers.forEach((sleeper) => sleeper.resolve());
+      const search = await searchPromise;
+      expect(search.status).toBe(200);
+      expect(searchCalls).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

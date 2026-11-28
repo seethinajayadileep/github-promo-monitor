@@ -3,11 +3,15 @@ import {
   applyLlmExtraction,
   buildSarvamChatRequest,
   configuredLlmProvider,
+  cleanSnippetText,
   enrichAndGateCandidates,
   extractPassOne,
   extractWithLlm,
+  expandLlmCandidates,
   isRejectedCodeToken,
+  parseExpiry,
   parseLlmJson,
+  splitCodeList,
   SARVAM_DEFAULT_MODEL,
   SARVAM_DEFAULT_URL,
   SARVAM_MAX_TOKENS
@@ -19,6 +23,28 @@ const vendors: VendorConfig[] = [
   { id: 'firecrawl', name: 'Firecrawl', category: 'developer-tools', domains: ['firecrawl.dev'], keywords: ['Firecrawl'] },
   { id: 'apify', name: 'Apify', category: 'developer-tools', domains: ['apify.com'], keywords: ['Apify'] }
 ];
+
+const ambiguousVendors: VendorConfig[] = [
+  ...vendors,
+  { id: 'github', name: 'GitHub', category: 'developer-tools', domains: ['github.com', 'education.github.com'], keywords: ['GitHub Copilot', 'GitHub Student Developer Pack'] },
+  { id: 'modal', name: 'Modal', category: 'cloud', domains: ['modal.com'], keywords: ['Modal Labs', 'Modal'] },
+  { id: 'anthropic', name: 'Anthropic', category: 'ai', domains: ['anthropic.com'], keywords: ['Anthropic', 'Claude'] },
+  { id: 'neon', name: 'Neon', category: 'developer-tools', domains: ['neon.tech'], keywords: ['Neon database', 'Neon Postgres'] },
+  { id: 'exa', name: 'Exa', category: 'ai', domains: ['exa.ai'], keywords: ['Exa AI', 'exa.ai'] },
+  { id: 'render', name: 'Render', category: 'cloud', domains: ['render.com'], keywords: ['Render'] },
+  { id: 'cursor', name: 'Cursor', category: 'ai', domains: ['cursor.com', 'cursor.sh'], keywords: ['Cursor Pro', 'Cursor AI', 'Cursor credits'] }
+];
+
+function extractWithVendors(text: string, vendorConfigs = ambiguousVendors) {
+  return extractPassOne({
+    text,
+    vendors: vendorConfigs,
+    sourceUrl: 'https://github.com/example/repo/blob/main/README.md',
+    sourceType: 'code',
+    repoFullName: 'example/repo',
+    path: 'README.md'
+  });
+}
 
 function extract(text: string) {
   return extractPassOne({
@@ -160,6 +186,55 @@ describe('stage 3 pass-one extractor', () => {
     const text = 'Use code HACK-NATION for OpenAI free credits. Use code BOLTJUDGES100 for OpenAI free credits. Use code APRIL-2026 for OpenAI free credits.';
     expect(extract(text).candidates.map((item) => item.code)).toEqual(expect.arrayContaining(['HACK-NATION', 'BOLTJUDGES100', 'APRIL-2026']));
   });
+
+  it('keeps comma-separated multi-code strings as separate Pass-1 candidates', () => {
+    const result = extract('Use codes CRAVE50, WELCOME100 for OpenAI hackathon credits.');
+    expect(result.candidates.map((item) => item.code)).toEqual(expect.arrayContaining(['CRAVE50', 'WELCOME100']));
+    expect(result.candidates.some((item) => item.code.includes(','))).toBe(false);
+  });
+
+  it('rejects newly identified non-promo compounds and hex commit SHAs', () => {
+    const rejected = [
+      'ADD-COUPON', 'COUPON-VS-COOKIE', 'BEST-5', 'BLACK-HAT-RUST', 'STUDENT-PROGRAM',
+      'AUTO-APPLIED', 'FUNCTION-CALLING', 'NEW-USER', 'CBAA3E49', 'A1B2C3D4E5F6A7'
+    ];
+    for (const token of rejected) expect(isRejectedCodeToken(token), token).toBe(true);
+    expect(isRejectedCodeToken('BF2025')).toBe(false);
+  });
+
+  it('does not treat bare UI or host words as vendors and requires boundaries for short names', () => {
+    expect(extractWithVendors('Use code HACK2025 for credits. Mirror: https://github.com/example/repo').candidates).toEqual([]);
+    expect(extractWithVendors('Use code HACK2025 for Modal credits in a coupon popup').candidates).toEqual([]);
+    expect(extractWithVendors('Use code HACK2025 for Cursorless examples').candidates).toEqual([]);
+    expect(extractWithVendors('Use code HACK2025 for Renderflex examples').candidates).toEqual([]);
+    expect(extractWithVendors('Use code HACK2025 for exactitude examples').candidates).toEqual([]);
+  });
+
+  it('still matches ambiguous vendors when product context is present', () => {
+    const modal = extractWithVendors('Use code MODALGPU2025 for Modal serverless GPU cloud credits.');
+    expect(modal.candidates[0]?.vendor).toBe('Modal');
+    const github = extractWithVendors('Use code COPILOT2025 for GitHub Copilot student credits at https://education.github.com/pack');
+    expect(github.candidates[0]?.vendor).toBe('GitHub');
+    const cursor = extractWithVendors('Use code CURSORPRO2025 for Cursor editor Pro credits.');
+    expect(cursor.candidates[0]?.vendor).toBe('Cursor');
+  });
+
+  it('parses valid-to month dates and ISO dates in markdown tables', () => {
+    const reference = new Date('2025-11-01T00:00:00Z');
+    expect(parseExpiry('valid to Nov 28', reference)?.toISOString()).toBe('2025-11-28T23:59:59.000Z');
+    expect(parseExpiry('| expires | 2025-12-01 |', reference)?.toISOString()).toBe('2025-12-01T23:59:59.000Z');
+  });
+
+  it('keeps URLs intact and strips markdown/html noise from snippets', () => {
+    const result = extract('- **Hackathon:** use code CLEANURL2025 for <strong>OpenAI</strong> credits, redeem at https://platform.openai.com/redeem before expiry. Next sentence.');
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0].snippet).toContain('https://platform.openai.com/redeem');
+    expect(result.candidates[0].snippet).not.toContain('Next sentence');
+    expect(result.candidates[0].snippet).not.toContain('<strong>');
+    expect(result.candidates[0].snippet).not.toMatch(/^- \*\*/);
+    expect(cleanSnippetText('- **OpenAI** `credits`')).toBe('OpenAI credits');
+    expect(cleanSnippetText('Use APIFY_CAL_HACKS for credits')).toBe('Use APIFY_CAL_HACKS for credits');
+  });
 });
 
 describe('LLM extraction helpers', () => {
@@ -238,7 +313,7 @@ describe('LLM extraction helpers', () => {
       const llm = await extractWithLlm('Licensed under BSD-3-CLAUSE. See the OpenAI docs.', vendors);
       expect(llm).toEqual({ isPublicPromo: false });
       expect(applyLlmExtraction(sampleCandidate, llm, vendors)).toBeNull();
-      expect(payloads[0]).toMatchObject({ model: 'sarvam-105b', stream: false, reasoning_effort: 'low', max_tokens: 1536 });
+      expect(payloads[0]).toMatchObject({ model: 'sarvam-105b', stream: false, reasoning_effort: 'low', max_tokens: 4096 });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -285,7 +360,7 @@ describe('LLM extraction helpers', () => {
         ['llm_gate_rejected', expect.objectContaining({ code: 'CROSS-BROWSER' })],
         ['llm_gate_failed', expect.objectContaining({ code: 'SHOULD_SKIP' })]
       ]));
-      expect(calls).toBe(3);
+      expect(calls).toBe(5);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -301,7 +376,7 @@ describe('LLM extraction helpers', () => {
       const events: Array<[string, Record<string, unknown>]> = [];
       const result = await enrichAndGateCandidates([sampleCandidate], vendors, (event, details) => events.push([event, details]));
       expect(result).toEqual([]);
-      expect(events).toEqual([['llm_gate_failed', expect.objectContaining({ code: 'BSD-3-CLAUSE', reason: 'empty-or-timeout' })]]);
+      expect(events).toEqual([['llm_gate_failed', expect.objectContaining({ code: 'BSD-3-CLAUSE', reason: 'empty-content-no-finish-reason' })]]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -322,6 +397,115 @@ describe('LLM extraction helpers', () => {
       const result = await enrichAndGateCandidates(many, vendors);
       expect(calls).toBe(12);
       expect(result).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('trusts cleaned Sarvam vendor names, canonicalizes configured vendors, and rejects UI vendors', () => {
+    const llmBase = {
+      isPublicPromo: true,
+      code: 'NEBIUS2026',
+      offerSummary: 'Cloud credits',
+      confidence: 'high' as const
+    };
+    expect(applyLlmExtraction(sampleCandidate, { ...llmBase, vendor: 'OpenAI' }, vendors)?.vendor).toBe('OpenAI');
+    expect(applyLlmExtraction(sampleCandidate, { ...llmBase, vendor: 'LeanMCP' }, vendors)?.vendor).toBe('LeanMCP');
+    expect(applyLlmExtraction(sampleCandidate, { ...llmBase, vendor: 'Sidrune AI' }, vendors)?.vendor).toBe('Sidrune AI');
+    expect(applyLlmExtraction(sampleCandidate, { ...llmBase, vendor: 'Modal' }, vendors)).toBeNull();
+    expect(applyLlmExtraction(sampleCandidate, { ...llmBase, vendor: 'unknown' }, vendors)).toBeNull();
+    expect(applyLlmExtraction(sampleCandidate, { ...llmBase, vendor: 'GitHub' }, vendors)).toBeNull();
+  });
+
+  it('expands comma-separated Sarvam multi-codes into individual candidates', () => {
+    expect(splitCodeList('CRAVE50, WELCOME100')).toEqual(['CRAVE50', 'WELCOME100']);
+    const expanded = expandLlmCandidates(sampleCandidate, {
+      isPublicPromo: true,
+      vendor: 'Apify',
+      code: 'CRAVE50, WELCOME100',
+      confidence: 'medium'
+    }, vendors);
+    expect(expanded.map((item) => item.code)).toEqual(['CRAVE50', 'WELCOME100']);
+    expect(expanded.every((item) => !item.code.includes(','))).toBe(true);
+  });
+
+  it('sanitizes LLM redeem URLs and expiry formats while parsing', () => {
+    const parsed = parseLlmJson('{"is_public_promo":true,"vendor":"Apify","code":"APIFY2026","offer_summary":"**$200** credits","redeem_url":"https://apify.com/redeem`.","expires_at":"Nov 28 2025","confidence":"high"}');
+    expect(parsed?.redeemUrl).toBe('https://apify.com/redeem');
+    expect(parsed?.expiresAt?.toISOString()).toBe('2025-11-28T23:59:59.000Z');
+    expect(parsed?.offerSummary).toBe('$200 credits');
+    const unsafe = parseLlmJson('{"is_public_promo":true,"vendor":"Apify","code":"APIFY2026","redeem_url":"javascript:alert(1)"}');
+    expect(unsafe?.redeemUrl).toBeUndefined();
+  });
+
+  it('retries transient Sarvam finish-length failures and then accepts valid JSON', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: '' }, finish_reason: 'length' }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"is_public_promo":true,"vendor":"Apify","code":"APIFY2026","confidence":"high"}' }, finish_reason: 'stop' }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const result = await extractWithLlm('Use code APIFY2026 for Apify credits.', vendors);
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({ isPublicPromo: true, vendor: 'Apify', code: 'APIFY2026' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('logs the real Sarvam HTTP error body after bounded retries', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: 'upstream overloaded near capacity' }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' }
+      });
+    }) as typeof fetch;
+    try {
+      const events: Array<[string, Record<string, unknown>]> = [];
+      const result = await enrichAndGateCandidates([sampleCandidate], vendors, (event, details) => events.push([event, details]));
+      expect(result).toEqual([]);
+      expect(calls).toBe(3);
+      expect(String(events[0]?.[1]?.reason)).toContain('http-500');
+      expect(String(events[0]?.[1]?.reason)).toContain('upstream overloaded near capacity');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('sends the wider llmContext around the match instead of only the short snippet', async () => {
+    process.env.SARVAM_API_KEY = 'test-key';
+    const originalFetch = globalThis.fetch;
+    const bodies: string[] = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      bodies.push(String(init?.body));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"is_public_promo":true,"vendor":"LeanMCP","code":"LEAN2026","confidence":"high"}' }}]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    const wideCandidate = {
+      ...sampleCandidate,
+      snippet: 'Use code LEAN2026.',
+      llmContext: `${'padding '.repeat(150)}LeanMCP product console https://leanmcp.com/redeem expires Nov 28. Use code LEAN2026.${'more padding '.repeat(100)}`
+    };
+    try {
+      const result = await enrichAndGateCandidates([wideCandidate], vendors);
+      expect(result[0]?.vendor).toBe('LeanMCP');
+      expect(bodies[0]).toContain('LeanMCP product console');
+      expect(bodies[0]).toContain('https://leanmcp.com/redeem');
     } finally {
       globalThis.fetch = originalFetch;
     }

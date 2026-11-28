@@ -105,6 +105,26 @@ function githubErrorMessage(data: unknown, status: number): string {
   return payload && payload.message != null ? String(payload.message) : `HTTP ${status}`;
 }
 
+interface GitHubRequestOptions {
+  cacheKey?: string;
+  accept?: string;
+  method?: string;
+  body?: unknown;
+  retryOnRateLimit?: boolean;
+}
+
+interface PerformedRequest<T> {
+  response?: GitHubResponse<T>;
+  primaryRateLimit?: RateLimitState;
+  secondaryRateLimit?: {
+    status: number;
+    rateLimit: RateLimitState;
+    retryAfter?: string | null;
+    error: Error;
+  };
+  error?: Error;
+}
+
 export class GitHubClient {
   readonly tokenPool: GitHubTokenPool;
   private readonly etagCache = new Map<string, CacheEntry>();
@@ -112,6 +132,7 @@ export class GitHubClient {
   private readonly sleepFn: SleepFn;
   private requestTail: Promise<void> = Promise.resolve();
   private lastSearchAt = 0;
+  private readonly blockedUntil = new Map<string, number>();
 
   constructor(env: NodeJS.ProcessEnv = process.env, options: { sleep?: SleepFn } = {}) {
     this.tokenPool = new GitHubTokenPool(env);
@@ -126,8 +147,79 @@ export class GitHubClient {
     this.etagCache.set(cacheKey, { etag });
   }
 
-  async request<T>(path: string, options: { cacheKey?: string; accept?: string; method?: string; body?: unknown; retryOnRateLimit?: boolean } = {}): Promise<GitHubResponse<T>> {
-    return this.withLock(() => this.requestUnlocked<T>(path, options));
+  resourceBlockedUntil(resource: string): number | undefined {
+    return this.blockedUntil.get(resource);
+  }
+
+  async request<T>(path: string, options: GitHubRequestOptions = {}): Promise<GitHubResponse<T>> {
+    const resource = rateLimitResourceFromPath(path) ?? 'unknown';
+    const waitResources = path.startsWith('/search/') && resource !== 'search' ? [resource, 'search'] : [resource];
+    const retryOnRateLimit = options.retryOnRateLimit ?? true;
+    let primaryRetried = false;
+    for (let attempt = 0; ; attempt += 1) {
+      await this.waitForResourceBlocks(waitResources);
+      const performed = await this.withLock(() => this.performRequest<T>(path, options));
+      if (performed.response) return performed.response;
+
+      if (performed.primaryRateLimit && retryOnRateLimit && !primaryRetried) {
+        primaryRetried = true;
+        if (this.tokenPool.size > 1) {
+          this.tokenPool.rotate();
+          continue;
+        }
+        const waitMs = primaryRateLimitWaitMs(performed.primaryRateLimit);
+        this.blockResource(resource, waitMs);
+        await this.sleepOutsideLock(resource, waitMs);
+        continue;
+      }
+
+      if (performed.secondaryRateLimit && attempt < SECONDARY_RATE_LIMIT_MAX_RETRIES) {
+        const secondary = performed.secondaryRateLimit;
+        const waitMs = secondaryRateLimitBackoffMs(secondary.retryAfter);
+        console.log(JSON.stringify({
+          event: 'github_secondary_rate_limit',
+          at: new Date().toISOString(),
+          status: secondary.status,
+          resource: secondary.rateLimit.resource,
+          waitMs,
+          attempt: attempt + 1
+        }));
+        this.blockResource(secondary.rateLimit.resource ?? resource, waitMs);
+        await this.sleepOutsideLock(secondary.rateLimit.resource ?? resource, waitMs);
+        continue;
+      }
+
+      throw performed.error ?? performed.secondaryRateLimit?.error ?? new Error('GitHub request failed');
+    }
+  }
+
+  private blockResource(resource: string, waitMs: number): void {
+    this.blockedUntil.set(resource, Date.now() + Math.max(0, waitMs));
+  }
+
+  private async sleepOutsideLock(resource: string, waitMs: number): Promise<void> {
+    await this.sleepFn(Math.max(0, waitMs));
+    this.blockedUntil.delete(resource);
+  }
+
+  private async waitForResourceBlocks(resources: string[]): Promise<void> {
+    const now = Date.now();
+    let longestWait = 0;
+    for (const resource of resources) {
+      const until = this.blockedUntil.get(resource);
+      if (!until) continue;
+      const waitMs = until - now;
+      if (waitMs <= 0) {
+        this.blockedUntil.delete(resource);
+        continue;
+      }
+      longestWait = Math.max(longestWait, waitMs);
+    }
+    if (!longestWait) return;
+    await this.sleepFn(longestWait);
+    for (const resource of resources) {
+      if ((this.blockedUntil.get(resource) ?? Number.POSITIVE_INFINITY) <= Date.now()) this.blockedUntil.delete(resource);
+    }
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -144,12 +236,7 @@ export class GitHubClient {
     }
   }
 
-  private async requestUnlocked<T>(
-    path: string,
-    options: { cacheKey?: string; accept?: string; method?: string; body?: unknown; retryOnRateLimit?: boolean },
-    attempt = 0
-  ): Promise<GitHubResponse<T>> {
-    const retryOnRateLimit = options.retryOnRateLimit ?? true;
+  private async performRequest<T>(path: string, options: GitHubRequestOptions): Promise<PerformedRequest<T>> {
     if (path.startsWith('/search/')) {
       const wait = this.lastSearchAt + SEARCH_MIN_GAP_MS - Date.now();
       if (wait > 0) await this.sleepFn(wait);
@@ -183,41 +270,40 @@ export class GitHubClient {
     };
     const etag = response.headers.get('etag') ?? undefined;
     if (options.cacheKey && etag) this.etagCache.set(options.cacheKey, { etag });
-    if (response.status === 304) return { status: response.status, notModified: true, etag, rateLimit };
+    if (response.status === 304) return { response: { status: response.status, notModified: true, etag, rateLimit } };
 
     const text = await response.text();
-    const data = text ? JSON.parse(text) as T : undefined;
-
-    if (response.status === 403 && rateLimit.remaining === 0 && retryOnRateLimit) {
-      if (this.tokenPool.size > 1) this.tokenPool.rotate();
-      else await this.waitForRateLimit(rateLimit);
-      return this.requestUnlocked<T>(path, { ...options, retryOnRateLimit: false }, attempt);
+    let data: T | undefined;
+    try {
+      data = text ? JSON.parse(text) as T : undefined;
+    } catch {
+      data = undefined;
     }
 
-    if (isSecondaryRateLimit(response.status, rateLimit, data, retryAfter) && attempt < SECONDARY_RATE_LIMIT_MAX_RETRIES) {
-      const waitMs = secondaryRateLimitBackoffMs(retryAfter);
-      console.log(JSON.stringify({
-        event: 'github_secondary_rate_limit',
-        at: new Date().toISOString(),
-        status: response.status,
-        resource: rateLimit.resource,
-        waitMs,
-        attempt: attempt + 1
-      }));
-      await this.sleepFn(waitMs);
-      return this.requestUnlocked<T>(path, options, attempt + 1);
+    if (response.status === 403 && rateLimit.remaining === 0) {
+      return { primaryRateLimit: rateLimit, error: new Error(formatGitHubError(response.status, data)) };
     }
 
-    if (!response.ok && response.status !== 304) {
-      throw new Error(formatGitHubError(response.status, data));
+    if (isSecondaryRateLimit(response.status, rateLimit, data, retryAfter)) {
+      return {
+        secondaryRateLimit: {
+          status: response.status,
+          rateLimit,
+          retryAfter,
+          error: new Error(formatGitHubError(response.status, data))
+        }
+      };
     }
-    return { status: response.status, data, etag, notModified: false, rateLimit };
+
+    if (!response.ok) {
+      return { error: new Error(formatGitHubError(response.status, data)) };
+    }
+    return { response: { status: response.status, data, etag, notModified: false, rateLimit } };
   }
 
   async waitForRateLimit(rateLimit: RateLimitState): Promise<void> {
     if (rateLimit.remaining !== 0 || !rateLimit.reset) return;
-    const waitMs = Math.max(1000, rateLimit.reset * 1000 - Date.now() + 1000);
-    await this.sleepFn(Math.min(waitMs, 15 * 60 * 1000));
+    await this.sleepFn(primaryRateLimitWaitMs(rateLimit));
   }
 
   async paceIfNeeded(rateLimit: RateLimitState, minimumPercent: number): Promise<void> {
@@ -230,6 +316,12 @@ export class GitHubClient {
     }
     await this.waitForRateLimit({ remaining: 0, reset: rateLimit.reset });
   }
+}
+
+function primaryRateLimitWaitMs(rateLimit: RateLimitState): number {
+  if (!rateLimit.reset) return 1000;
+  const waitMs = Math.max(1000, rateLimit.reset * 1000 - Date.now() + 1000);
+  return Math.min(waitMs, 15 * 60 * 1000);
 }
 
 export function formatGitHubError(status: number, data: unknown): string {

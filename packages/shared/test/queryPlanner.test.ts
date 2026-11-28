@@ -8,6 +8,7 @@ import {
   GITHUB_SEARCH_QUALIFIER_RESERVE,
   addCommitDateWindow,
   addIssueQualifier,
+  addRecentCommitDateWindow,
   buildCodeSearchQueries,
   buildSearchQueries,
   collectVendorSearchTerms,
@@ -58,8 +59,13 @@ describe('GitHub query planner', () => {
     expect(isValidGitHubSearchQuery(issues)).toBe(true);
   });
 
+  it('adds a rolling recent committer-date window for live commit scans', () => {
+    const recent = addRecentCommitDateWindow('coupon OpenAI', 7, new Date('2026-02-10T15:00:00Z'));
+    expect(recent).toBe('coupon OpenAI committer-date:2026-02-04..2026-02-10');
+  });
+
   it('keeps every generated query for all live vendors within GitHub Search limits', () => {
-    expect(liveVendors).toHaveLength(40);
+    expect(liveVendors).toHaveLength(48);
     const queries = buildSearchQueries(liveVendors);
     expect(queries.length).toBeGreaterThan(0);
     // 12 queries × (commits + issues) stays under GitHub's 30 search req/min.

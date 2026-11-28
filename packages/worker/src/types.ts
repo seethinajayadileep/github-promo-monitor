@@ -20,6 +20,7 @@ export interface IssueSearchItem {
 export interface CodeSearchItem {
   html_url: string;
   path: string;
+  sha?: string;
   repository?: { full_name?: string };
   text_matches?: Array<{ fragment?: string }>;
 }

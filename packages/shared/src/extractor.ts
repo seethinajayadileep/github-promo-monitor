@@ -1,6 +1,7 @@
 import { canonicalCode } from './dedupe.js';
 import { rejectSecrets } from './secrets.js';
 import { isCryptoOrSpam } from './spam.js';
+import { sanitizeRedeemUrl } from './urls.js';
 import type { Confidence, ExtractedPromo, PromoCandidate, SourceType, VendorConfig } from './types.js';
 
 const PUBLIC_CUES = [
@@ -42,7 +43,8 @@ const GENERIC_COMPOUND_CODES = new Set([
   'FREE-TRIAL', 'PRO-PLAN', 'PROMO-CODE', 'CREDIT-CODE', 'GIFT-CARD', 'NO-CODE', 'LOW-CODE', 'AI-POWERED',
   'CLOUD-NATIVE', 'ZERO-SHOT', 'FEW-SHOT', 'FINE-TUNE', 'MULTI-AGENT', 'AUTO-DEPLOY', 'DARK-MODE',
   'LIGHT-MODE', 'WEB-APP', 'MOBILE-APP', 'API-KEY', 'ACCESS-TOKEN', 'AS-BUILT', 'UPSTREAM-QUALIFIED',
-  'MAKE-PROMO-CODE'
+  'MAKE-PROMO-CODE', 'ADD-COUPON', 'COUPON-VS-COOKIE', 'BEST-5', 'BLACK-HAT-RUST',
+  'STUDENT-PROGRAM', 'AUTO-APPLIED', 'FUNCTION-CALLING', 'NEW-USER'
 ]);
 
 const ENV_VAR_SUFFIXES = [
@@ -74,9 +76,9 @@ const TECH_PREFIX_PATTERN = /^(?:UTF|UTF8|SHA|SHA1|SHA2|SHA3|MD5|AES|RSA|HTTP|HT
 
 export const SARVAM_DEFAULT_URL = 'https://api.sarvam.ai/v2/chat/completions';
 export const SARVAM_DEFAULT_MODEL = 'sarvam-105b';
-export const SARVAM_MAX_TOKENS = 1536;
+export const SARVAM_MAX_TOKENS = 4096;
 
-const LLM_SYSTEM_PROMPT = 'Extract only intentionally public, actionable SaaS/AI/developer-tool promotional, coupon, or credit codes a person can redeem. Never output credentials. Reject environment-variable and identifier names (ELEVENLABS_API_KEY, DISCOUNT_CODE, ADMIN_ACCESS_TOKEN, or tokens ending in _ID, _TOKEN, _KEY, _SECRET, _CODE), placeholder strings (YOUR_CODE_HERE, PROMO123), CSS/UI tokens, license IDs, CVEs, and generic English or hyphenated tech phrases (CROSS-BROWSER, STEP-BY-STEP, OPEN-SOURCE, SINGLE-FILE). Return strict JSON.';
+const LLM_SYSTEM_PROMPT = 'Extract only intentionally public, actionable SaaS/AI/developer-tool promotional, coupon, or credit codes a person can redeem. Never output credentials. Name the exact product or service where the code is redeemed. Never use UI or component words such as Modal, Dialog, Button, Popup, or Banner as the vendor; never answer GitHub merely because the snippet is hosted on GitHub; reject UI popup demos such as a 1-Click Coupon Modal. Reject environment-variable and identifier names (ELEVENLABS_API_KEY, DISCOUNT_CODE, ADMIN_ACCESS_TOKEN, or tokens ending in _ID, _TOKEN, _KEY, _SECRET, _CODE), placeholder strings (YOUR_CODE_HERE, PROMO123), CSS/UI tokens, license IDs, CVEs, commit SHAs, and generic English or hyphenated tech phrases (CROSS-BROWSER, STEP-BY-STEP, OPEN-SOURCE, SINGLE-FILE). If multiple real comma-separated codes are intentionally listed, return them exactly as a comma-separated code string. Return strict JSON.';
 
 export interface PassOneInput {
   text: string;
@@ -119,14 +121,90 @@ function vendorTerms(vendor: VendorConfig): string[] {
   return [vendor.name, vendor.id, ...vendor.keywords].map((term) => term.toLowerCase()).filter(Boolean);
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeVendorKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function findTermOccurrence(text: string, term: string): number {
+  const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(term)}(?![A-Za-z0-9])`, 'i');
+  const match = pattern.exec(text);
+  return match?.index ?? -1;
+}
+
+const AMBIGUOUS_VENDOR_TERMS = new Set(['github', 'modal', 'claude', 'neon', 'exa', 'render', 'cursor']);
+const VENDOR_PRODUCT_CONTEXTS: Record<string, string[]> = {
+  github: ['copilot', 'student developer pack', 'education.github.com', 'github education', 'github student'],
+  modal: ['modal labs', 'modal.com', 'gpu cloud', 'serverless gpu', 'sandboxes'],
+  claude: ['anthropic', 'claude.ai', 'console.anthropic.com'],
+  neon: ['neon database', 'neon postgres', 'neon.tech', 'serverless postgres', 'database'],
+  exa: ['exa ai', 'exa.ai', 'search api'],
+  render: ['render.com', 'deploy', 'hosting', 'cloud platform', 'web service'],
+  cursor: ['cursor pro', 'cursor ai', 'cursor.com', 'cursor.sh', 'editor', 'ide']
+};
+
+function requiresProductContext(vendor: VendorConfig, term: string): boolean {
+  const key = normalizeVendorKey(term);
+  return AMBIGUOUS_VENDOR_TERMS.has(key) && key === normalizeVendorKey(vendor.name) ||
+    AMBIGUOUS_VENDOR_TERMS.has(key) && vendor.keywords.some((keyword) => normalizeVendorKey(keyword) === key);
+}
+
+function hasProductContext(text: string, index: number, length: number, vendor: VendorConfig): boolean {
+  const start = Math.max(0, index - 140);
+  const end = Math.min(text.length, index + length + 140);
+  const nearby = text.slice(start, end).toLowerCase();
+  const contexts = VENDOR_PRODUCT_CONTEXTS[vendor.id] ?? [];
+  if (contexts.some((term) => nearby.includes(term))) return true;
+  if (vendor.id === 'github') return false;
+  return vendor.domains.some((domain) => nearby.includes(domain.toLowerCase()));
+}
+
 function matchingVendor(text: string, vendors: VendorConfig[]): VendorConfig | undefined {
-  const lower = text.toLowerCase();
-  return vendors.find((vendor) => vendorTerms(vendor).some((term) => term && lower.includes(term)));
+  for (const vendor of vendors) {
+    const terms = vendorTerms(vendor).sort((a, b) => b.length - a.length);
+    for (const term of terms) {
+      const index = findTermOccurrence(text, term);
+      if (index < 0) continue;
+      if (!requiresProductContext(vendor, term) || hasProductContext(text, index, term.length, vendor)) return vendor;
+    }
+  }
+  return undefined;
+}
+
+function urlHostAndPath(rawUrl: string): { host: string; path: string } | undefined {
+  try {
+    const parsed = new URL(rawUrl.replace(/[`'\".,;:!?)\]}>]+$/g, ''));
+    return { host: parsed.hostname.toLowerCase(), path: parsed.pathname.toLowerCase() };
+  } catch {
+    return undefined;
+  }
+}
+
+function domainMatches(host: string, domain: string): boolean {
+  const normalized = domain.toLowerCase();
+  return host === normalized || host.endsWith(`.${normalized}`);
 }
 
 function matchingVendorByUrl(text: string, vendors: VendorConfig[]): VendorConfig | undefined {
-  const lower = text.toLowerCase();
-  return vendors.find((vendor) => vendor.domains.some((domain) => lower.includes(domain.toLowerCase())));
+  const urls = text.match(URL_PATTERN) ?? [];
+  for (const vendor of vendors) {
+    for (const rawUrl of urls) {
+      const parsed = urlHostAndPath(rawUrl);
+      if (!parsed) continue;
+      for (const domain of vendor.domains) {
+        if (!domainMatches(parsed.host, domain)) continue;
+        if (vendor.id === 'github') {
+          const githubProductUrl = parsed.host === 'education.github.com' || /copilot|education|student/.test(parsed.path);
+          if (!githubProductUrl) continue;
+        }
+        return vendor;
+      }
+    }
+  }
+  return undefined;
 }
 
 function windowAround(text: string, index: number, length: number, radius = VENDOR_PROXIMITY_CHARS): string {
@@ -143,15 +221,48 @@ function matchingVendorNear(text: string, index: number, length: number, vendors
 function redemptionUrlFor(text: string, vendor?: VendorConfig): string | undefined {
   const urls = text.match(URL_PATTERN) ?? [];
   if (!vendor) return undefined;
-  return urls.find((url) => vendor.domains.some((domain) => url.toLowerCase().includes(domain.toLowerCase())));
+  for (const raw of urls) {
+    const url = sanitizeRedeemUrl(raw);
+    if (!url) continue;
+    const parsed = urlHostAndPath(url);
+    if (parsed && vendor.domains.some((domain) => domainMatches(parsed.host, domain))) return url;
+  }
+  return undefined;
 }
 
-function parseExpiry(text: string): Date | undefined {
-  const expiryContext = /(?:expires?|valid(?: until| through)?|ends?|before)\s+(?:on\s+)?([A-Z][a-z]+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{2,4})/i;
+const MONTHS: Record<string, number> = {
+  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+  may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8,
+  september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11
+};
+
+export function parseExpiryDateValue(value: string, referenceDate = new Date()): Date | undefined {
+  const trimmed = value.trim().replace(/[.,;:!?)\]}>`'"]+$/g, '');
+  if (!trimmed) return undefined;
+  const iso = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]), 23, 59, 59));
+  const monthName = trimmed.match(/^([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,)?(?:\s+(\d{4}))?$/);
+  if (monthName) {
+    const month = MONTHS[monthName[1].toLowerCase()];
+    if (month !== undefined) {
+      const year = monthName[3] ? Number(monthName[3]) : referenceDate.getUTCFullYear();
+      return new Date(Date.UTC(year, month, Number(monthName[2]), 23, 59, 59));
+    }
+  }
+  const numeric = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (numeric) {
+    const year = Number(numeric[3].length === 2 ? `20${numeric[3]}` : numeric[3]);
+    return new Date(Date.UTC(year, Number(numeric[1]) - 1, Number(numeric[2]), 23, 59, 59));
+  }
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+export function parseExpiry(text: string, referenceDate = new Date()): Date | undefined {
+  const expiryContext = /(?:expires?|valid(?:\s+(?:until|through|to))?|ends?|before|until|deadline)\s*(?:on\s+)?[|:=-]*\s*([A-Z][a-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{2,4})/i;
   const match = text.match(expiryContext);
   if (!match) return undefined;
-  const parsed = new Date(match[1]);
-  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+  return parseExpiryDateValue(match[1], referenceDate);
 }
 
 function cleanCode(raw: string): string {
@@ -174,6 +285,7 @@ export function isRejectedCodeToken(raw: string): boolean {
   if (isEnvVarOrIdentifierName(token)) return true;
   if (LICENSE_CODE_PATTERN.test(token) || CVE_CODE_PATTERN.test(token) || TECH_PREFIX_PATTERN.test(token)) return true;
   if (/^HTTPS?-/i.test(token)) return true;
+  if (/^[0-9A-F]{7,40}$/.test(token) && /[A-F]/.test(token) && /\d/.test(token)) return true;
   if (GENERIC_HYPHEN_BRIDGE_PATTERN.test(token) || GENERIC_HYPHEN_SUFFIX_PATTERN.test(token)) return true;
   if (isCssUiCompound(token)) return true;
   return false;
@@ -192,12 +304,52 @@ function isPlausibleCode(raw: string, original: string, stopwords: Set<string>):
   return original === original.toUpperCase() && /[AEIOU]/.test(raw);
 }
 
+export function cleanSnippetText(value: string): string {
+  return normalizeWhitespace(value
+    .replace(/<\/?[A-Za-z][^>]*>/g, ' ')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1 $2')
+    .replace(/^\s*[-*+]\s+/, '')
+    .replace(/^[\s>#]+/, '')
+    .replace(/(?<!\w)\*\*([^*]+)\*\*(?!\w)/g, '$1')
+    .replace(/(?<!\w)__([^_]+)__(?!\w)/g, '$1')
+    .replace(/(?<!\w)\*([^*]+)\*(?!\w)/g, '$1')
+    .replace(/(?<!\w)_([^_]+)_(?!\w)/g, '$1')
+    .replace(/`/g, '')
+    .replace(/\s+/g, ' ')
+  );
+}
+
+function isUrlPunctuation(text: string, position: number): boolean {
+  if (text[position] !== '.') return false;
+  const before = text.slice(Math.max(0, position - 220), position + 1);
+  const token = before.match(/https?:\/\/\S*$/i)?.[0];
+  if (!token || token.length <= 10) return false;
+  const urlTail = text.slice(position).match(/^\.\S*/)?.[0] ?? '';
+  return urlTail.length > 1;
+}
+
+function sentenceBoundaryStart(text: string, index: number): number {
+  for (let position = index - 1; position >= Math.max(0, index - 180); position -= 1) {
+    if (text[position] === '\n') return position + 1;
+    if ((text[position] === '!' || text[position] === '?' || text[position] === '.') && !isUrlPunctuation(text, position)) return position + 1;
+  }
+  return Math.max(0, index - 140);
+}
+
+function sentenceBoundaryEnd(text: string, index: number, length: number): number {
+  const start = index + length;
+  for (let position = start; position < Math.min(text.length, start + 220); position += 1) {
+    if (text[position] === '\n') return position;
+    if ((text[position] === '!' || text[position] === '?' || text[position] === '.') && !isUrlPunctuation(text, position)) return position + 1;
+  }
+  return Math.min(text.length, start + 180);
+}
+
 function sentenceAround(text: string, index: number, length: number): string {
-  const start = Math.max(0, text.lastIndexOf('\n', index), text.lastIndexOf('.', index), index - 140);
-  const endCandidates = [text.indexOf('\n', index + length), text.indexOf('.', index + length)];
-  const positiveEnds = endCandidates.filter((value) => value >= 0);
-  const end = positiveEnds.length ? Math.min(...positiveEnds) + 1 : Math.min(text.length, index + length + 180);
-  return normalizeWhitespace(text.slice(start, end)).slice(0, 500);
+  const start = sentenceBoundaryStart(text, index);
+  const end = sentenceBoundaryEnd(text, index, length);
+  return cleanSnippetText(text.slice(start, end)).slice(0, 500);
 }
 
 function scoreConfidence(context: string, vendor: VendorConfig, redeemUrl?: string): Confidence {
@@ -259,8 +411,9 @@ export function extractPassOne(input: PassOneInput): FilteredExtraction {
       repoFullName: input.repoFullName,
       sourceDate: input.sourceDate,
       confidence,
-      expiresAt: parseExpiry(context) ?? parseExpiry(input.text),
-      snippet: context
+      expiresAt: parseExpiry(context, input.sourceDate) ?? parseExpiry(input.text, input.sourceDate),
+      snippet: context,
+      llmContext: cleanSnippetText(windowAround(input.text, index, match[0].length, 950)).slice(0, 2000)
     });
     if (candidates.length >= 8) break;
   }
@@ -282,20 +435,33 @@ export function extractJsonObject(value: string): string | null {
   return null;
 }
 
+export function splitCodeList(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[,;]+|\s+(?:and|or)\s+/i)
+    .map((part) => canonicalCode(part))
+    .map((part) => part.replace(/^[-_]+|[-_]+$/g, ''))
+    .filter(Boolean);
+}
+
+export function isSingleTokenCode(code: string): boolean {
+  return /^[A-Z0-9][A-Z0-9_-]{4,31}$/.test(code);
+}
+
 export function parseLlmJson(value: string): ExtractedPromo | null {
   const json = extractJsonObject(value);
   if (!json) return null;
   try {
     const parsed = JSON.parse(json) as Record<string, unknown>;
     if (parsed.is_public_promo !== true) return { isPublicPromo: false };
-    const expiresRaw = typeof parsed.expires_at === 'string' ? new Date(parsed.expires_at) : undefined;
+    const expiresRaw = typeof parsed.expires_at === 'string' ? parseExpiryDateValue(parsed.expires_at) : undefined;
     return {
       isPublicPromo: true,
       vendor: typeof parsed.vendor === 'string' ? parsed.vendor : undefined,
-      code: typeof parsed.code === 'string' ? canonicalCode(parsed.code) : undefined,
-      offerSummary: typeof parsed.offer_summary === 'string' ? parsed.offer_summary : undefined,
-      redeemUrl: typeof parsed.redeem_url === 'string' ? parsed.redeem_url : undefined,
-      expiresAt: expiresRaw && !Number.isNaN(expiresRaw.getTime()) ? expiresRaw : undefined,
+      code: typeof parsed.code === 'string' ? parsed.code.trim() : undefined,
+      offerSummary: typeof parsed.offer_summary === 'string' ? cleanSnippetText(parsed.offer_summary) : undefined,
+      redeemUrl: typeof parsed.redeem_url === 'string' ? sanitizeRedeemUrl(parsed.redeem_url) : undefined,
+      expiresAt: expiresRaw,
       confidence: normalizeLlmConfidence(parsed.confidence)
     };
   } catch {
@@ -353,19 +519,94 @@ function llmPrompt(text: string, vendors: VendorConfig[]): string {
     'Set is_public_promo=false for environment variable or identifier names (ELEVENLABS_API_KEY, DISCOUNT_CODE, *_ID, *_TOKEN, *_KEY, *_SECRET), placeholders (YOUR_CODE_HERE, PROMO123), CSS/UI tokens, and generic English or hyphenated phrases.\n\nText:\n' + text.slice(0, 6000);
 }
 
-async function callSarvam(prompt: string): Promise<string | null> {
+interface LlmCallOutcome {
+  content: string | null;
+  failureReason?: string;
+}
+
+function retryDelayMs(attempt: number): number {
+  return 250 * (attempt + 1);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function transientHttpStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+async function responseErrorSnippet(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    return text.replace(/\s+/g, ' ').slice(0, 240);
+  } catch {
+    return 'unreadable error body';
+  }
+}
+
+async function callSarvamDetailed(prompt: string): Promise<LlmCallOutcome> {
   const apiKey = process.env.SARVAM_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) return { content: null, failureReason: 'missing-api-key' };
   const request = buildSarvamChatRequest(prompt);
-  const response = await fetch(request.url, {
-    method: 'POST',
-    headers: request.headers,
-    body: JSON.stringify(request.body),
-    signal: AbortSignal.timeout(30_000)
-  });
-  if (!response.ok) return null;
-  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  return body.choices?.[0]?.message?.content ?? null;
+  let lastReason = 'unknown';
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    try {
+      const response = await fetch(request.url, {
+        method: 'POST',
+        headers: request.headers,
+        body: JSON.stringify(request.body),
+        signal: AbortSignal.timeout(30_000)
+      });
+      if (!response.ok) {
+        const snippet = await responseErrorSnippet(response);
+        lastReason = `http-${response.status}${snippet ? `: ${snippet}` : ''}`;
+        if (attempt < 2 && transientHttpStatus(response.status)) {
+          await delay(retryDelayMs(attempt));
+          continue;
+        }
+        return { content: null, failureReason: lastReason };
+      }
+      let body: { choices?: Array<{ message?: { content?: string }; finish_reason?: string }> };
+      try {
+        body = await response.json() as typeof body;
+      } catch {
+        lastReason = 'invalid-json-response';
+        if (attempt < 2) {
+          await delay(retryDelayMs(attempt));
+          continue;
+        }
+        return { content: null, failureReason: lastReason };
+      }
+      const choice = body.choices?.[0];
+      const content = choice?.message?.content ?? '';
+      const finishReason = choice?.finish_reason;
+      if (finishReason === 'length') {
+        lastReason = content.trim() ? 'finish-length-truncated-output' : 'finish-length-empty-content';
+      } else if (!content.trim()) {
+        lastReason = finishReason ? `empty-content-finish-${finishReason}` : 'empty-content-no-finish-reason';
+      } else {
+        return { content };
+      }
+      if (attempt < 2) {
+        await delay(retryDelayMs(attempt));
+        continue;
+      }
+      return { content: null, failureReason: lastReason };
+    } catch (error) {
+      const name = error instanceof Error ? error.name : '';
+      const message = error instanceof Error ? error.message : 'unknown';
+      lastReason = name === 'TimeoutError' || name === 'AbortError' || /timed out|timeout/i.test(message)
+        ? `timeout: ${message}`
+        : `network-error: ${message}`;
+      if (attempt < 2) {
+        await delay(retryDelayMs(attempt));
+        continue;
+      }
+      return { content: null, failureReason: lastReason };
+    }
+  }
+  return { content: null, failureReason: lastReason };
 }
 
 async function callOpenAi(prompt: string): Promise<string | null> {
@@ -408,18 +649,35 @@ async function callGemini(prompt: string): Promise<string | null> {
   return body.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('') || null;
 }
 
+export interface LlmExtractionOutcome {
+  result: ExtractedPromo | null;
+  failureReason?: string;
+}
+
+/** Stage 3 pass 2 with provider failure detail for gate logging. */
+export async function extractWithLlmDetailed(text: string, vendors: VendorConfig[]): Promise<LlmExtractionOutcome> {
+  const provider = configuredLlmProvider();
+  if (provider === 'none') return { result: null, failureReason: 'unconfigured' };
+  if (rejectSecrets(text).rejected) return { result: null, failureReason: 'rejected-secret-input' };
+  if (isCryptoOrSpam({ text, vendors })) return { result: null, failureReason: 'rejected-crypto-or-spam-input' };
+  const prompt = llmPrompt(text, vendors);
+  if (provider === 'sarvam') {
+    const outcome = await callSarvamDetailed(prompt);
+    if (!outcome.content) return { result: null, failureReason: outcome.failureReason ?? 'empty-response' };
+    const parsed = parseLlmJson(outcome.content);
+    return parsed
+      ? { result: parsed }
+      : { result: null, failureReason: 'unparseable-json-response' };
+  }
+  const raw = provider === 'openai' ? await callOpenAi(prompt) : await callGemini(prompt);
+  if (!raw) return { result: null, failureReason: `${provider}-empty-or-error` };
+  const parsed = parseLlmJson(raw);
+  return parsed ? { result: parsed } : { result: null, failureReason: `${provider}-unparseable-json-response` };
+}
+
 /** Stage 3 pass 2: optional low-cost LLM cleanup. Returns null when unconfigured or inconclusive. */
 export async function extractWithLlm(text: string, vendors: VendorConfig[]): Promise<ExtractedPromo | null> {
-  if (configuredLlmProvider() === 'none') return null;
-  if (rejectSecrets(text).rejected || isCryptoOrSpam({ text, vendors })) return null;
-  const prompt = llmPrompt(text, vendors);
-  const provider = configuredLlmProvider();
-  const raw = provider === 'sarvam'
-    ? await callSarvam(prompt)
-    : provider === 'openai'
-      ? await callOpenAi(prompt)
-      : await callGemini(prompt);
-  return raw ? parseLlmJson(raw) : null;
+  return (await extractWithLlmDetailed(text, vendors)).result;
 }
 
 /**
@@ -428,20 +686,64 @@ export async function extractWithLlm(text: string, vendors: VendorConfig[]): Pro
  * A null result is inconclusive: unconfigured callers may keep the Pass-1 candidate,
  * but a configured LLM gate must drop it instead of inserting unverified noise.
  */
+function cleanLlmVendorName(raw: string | undefined): string | undefined {
+  const cleaned = cleanSnippetText(raw ?? '').replace(/[.,;:!?)\]}>`'"]+$/g, '').trim();
+  return cleaned ? cleaned.slice(0, 100) : undefined;
+}
+
+function invalidLlmVendorName(vendor: string | undefined): boolean {
+  if (!vendor) return true;
+  const normalized = vendor.trim().toLowerCase();
+  return new Set(['unknown', 'null', 'none', 'n/a', 'na', 'modal', 'dialog', 'popup', 'button', 'banner', 'ui', 'coupon modal']).has(normalized);
+}
+
+function canonicalVendorMatch(vendorName: string, vendors: VendorConfig[]): VendorConfig | undefined {
+  const key = normalizeVendorKey(vendorName);
+  if (!key) return undefined;
+  return vendors.find((vendor) => {
+    const values = [vendor.name, vendor.id, ...vendor.keywords, ...vendor.domains];
+    return values.some((value) => normalizeVendorKey(value) === key);
+  });
+}
+
+function implausibleLlmCode(code: string): boolean {
+  return !isSingleTokenCode(code) || isRejectedCodeToken(code) || STOPWORDS.has(code);
+}
+
 export function applyLlmExtraction(candidate: PromoCandidate, llm: ExtractedPromo | null, vendors: VendorConfig[]): PromoCandidate | null {
   if (!llm) return candidate;
   if (!llm.isPublicPromo || !llm.code) return null;
-  const llmVendor = vendors.find((vendor) => vendor.name.toLowerCase() === llm.vendor?.toLowerCase() || vendor.id === llm.vendor?.toLowerCase());
+  const codes = splitCodeList(llm.code);
+  if (codes.length !== 1 || implausibleLlmCode(codes[0])) return null;
+  const llmVendorName = cleanLlmVendorName(llm.vendor);
+  if (invalidLlmVendorName(llmVendorName)) return null;
+  const context = `${candidate.llmContext ?? ''}\n${candidate.snippet}`.toLowerCase();
+  if (llmVendorName?.toLowerCase() === 'github' && !/copilot|student developer pack|github education|education\.github\.com/.test(context)) return null;
+  const canonical = canonicalVendorMatch(llmVendorName ?? '', vendors);
   return {
     ...candidate,
-    vendor: llmVendor?.name ?? candidate.vendor,
-    code: canonicalCode(llm.code),
-    category: llmVendor?.category ?? candidate.category,
-    offerSummary: llm.offerSummary || candidate.offerSummary,
-    redeemUrl: llm.redeemUrl || candidate.redeemUrl,
+    vendor: canonical?.name ?? llmVendorName ?? candidate.vendor,
+    code: codes[0],
+    category: canonical?.category ?? candidate.category,
+    offerSummary: llm.offerSummary ? cleanSnippetText(llm.offerSummary) : candidate.offerSummary,
+    redeemUrl: sanitizeRedeemUrl(llm.redeemUrl) ?? candidate.redeemUrl,
     expiresAt: llm.expiresAt ?? candidate.expiresAt,
     confidence: llm.confidence ?? candidate.confidence
   };
+}
+
+export function expandLlmCandidates(candidate: PromoCandidate, llm: ExtractedPromo, vendors: VendorConfig[]): PromoCandidate[] {
+  const codes = splitCodeList(llm.code);
+  if (codes.length <= 1) {
+    const applied = applyLlmExtraction(candidate, llm, vendors);
+    return applied ? [applied] : [];
+  }
+  const expanded: PromoCandidate[] = [];
+  for (const code of codes) {
+    const applied = applyLlmExtraction(candidate, { ...llm, code }, vendors);
+    if (applied) expanded.push(applied);
+  }
+  return expanded;
 }
 
 export interface LlmGateEvent {
@@ -465,17 +767,18 @@ export async function enrichAndGateCandidates(
   const enriched: PromoCandidate[] = [];
   for (const candidate of candidates) {
     try {
-      const llm = await extractWithLlm(candidate.snippet, vendors);
+      const outcome = await extractWithLlmDetailed(candidate.llmContext ?? candidate.snippet, vendors);
+      const llm = outcome.result;
       if (!llm) {
-        onEvent?.('llm_gate_failed', { vendor: candidate.vendor, code: candidate.code, reason: 'empty-or-timeout' });
+        onEvent?.('llm_gate_failed', { vendor: candidate.vendor, code: candidate.code, reason: outcome.failureReason ?? 'unknown' });
         continue;
       }
-      const applied = applyLlmExtraction(candidate, llm, vendors);
-      if (!applied) {
+      const applied = expandLlmCandidates(candidate, llm, vendors);
+      if (!applied.length) {
         onEvent?.('llm_gate_rejected', { vendor: candidate.vendor, code: candidate.code });
         continue;
       }
-      enriched.push(applied);
+      enriched.push(...applied);
     } catch (error) {
       onEvent?.('llm_gate_failed', {
         vendor: candidate.vendor,

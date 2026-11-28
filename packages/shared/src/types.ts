@@ -29,6 +29,7 @@ export interface PromoCandidate {
   confidence: Confidence;
   expiresAt?: Date;
   snippet: string;
+  llmContext?: string;
 }
 
 export interface ExtractedPromo {

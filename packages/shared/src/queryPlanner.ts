@@ -178,6 +178,14 @@ export function addCommitDateWindow(query: string, start: string, end: string): 
   return normalizeQuery(`${query} committer-date:${start}..${end}`);
 }
 
+export function addRecentCommitDateWindow(query: string, days: number, now = new Date()): string {
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - Math.max(1, Math.floor(days)) + 1);
+  const iso = (date: Date) => date.toISOString().slice(0, 10);
+  return addCommitDateWindow(query, iso(start), iso(end));
+}
+
 export function addIssueQualifier(query: string, kind: 'issue' | 'pr' = 'issue'): string {
   const qualifier = kind === 'pr' ? 'is:pr' : 'is:issue';
   return normalizeQuery(`${query} ${qualifier}`);

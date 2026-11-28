@@ -1,9 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { updatePromoStatus, type PromoStatus } from '@promo/shared';
 import { getPool } from '@/lib/db';
 
-const allowedStatuses = new Set<PromoStatus>(['active', 'unverified', 'likely_expired', 'expired', 'flagged']);
+export const dynamic = 'force-dynamic';
+
+const statuses = new Set<PromoStatus>(['active', 'unverified', 'likely_expired', 'expired', 'flagged']);
 
 function secretMatches(provided: string | undefined, expected: string): boolean {
   if (!provided) return false;
@@ -12,22 +14,29 @@ function secretMatches(provided: string | undefined, expected: string): boolean 
   return providedBuffer.length === expectedBuffer.length && timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
-export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { id: rawId } = await params;
-  let body: { status?: PromoStatus; adminSecret?: string };
+export async function PATCH(request: Request, context: { params: Promise<{ id: string }> | { id: string } }) {
+  const params = await context.params;
+  const id = Number.parseInt(params.id, 10);
+  if (!Number.isFinite(id) || id <= 0) {
+    return NextResponse.json({ error: 'invalid promo id' }, { status: 400 });
+  }
+
+  let payload: { status?: string; adminSecret?: string };
   try {
-    body = await request.json();
+    payload = await request.json() as typeof payload;
   } catch {
-    return NextResponse.json({ error: 'invalid_json' }, { status: 400 });
+    return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 });
   }
-  const expected = process.env.ADMIN_SECRET;
-  if (!expected || !secretMatches(body.adminSecret, expected)) {
-    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+
+  const configuredSecret = process.env.ADMIN_SECRET;
+  if (!configuredSecret || !secretMatches(payload.adminSecret, configuredSecret)) {
+    return NextResponse.json({ error: 'invalid admin secret' }, { status: 401 });
   }
-  const id = Number(rawId);
-  if (!Number.isInteger(id) || id <= 0 || !body.status || !allowedStatuses.has(body.status)) {
-    return NextResponse.json({ error: 'invalid_request' }, { status: 400 });
+  if (!payload.status || !statuses.has(payload.status as PromoStatus)) {
+    return NextResponse.json({ error: 'invalid status' }, { status: 400 });
   }
-  const updated = await updatePromoStatus(getPool(), id, body.status);
-  return updated ? NextResponse.json({ ok: true }) : NextResponse.json({ error: 'not_found' }, { status: 404 });
+
+  const updated = await updatePromoStatus(getPool(), id, payload.status as PromoStatus);
+  if (!updated) return NextResponse.json({ error: 'promo not found' }, { status: 404 });
+  return NextResponse.json({ ok: true, id, status: payload.status });
 }

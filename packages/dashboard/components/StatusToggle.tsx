@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useTransition } from 'react';
+import { useEffect, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 
 const statuses = ['active', 'unverified', 'likely_expired', 'expired', 'flagged'] as const;
@@ -11,6 +11,10 @@ export function StatusToggle({ id, currentStatus }: { id: number; currentStatus:
   const [message, setMessage] = useState('');
   const [pending, startTransition] = useTransition();
   const router = useRouter();
+
+  useEffect(() => {
+    setStatus(currentStatus);
+  }, [currentStatus]);
 
   return (
     <details className="min-w-56">
